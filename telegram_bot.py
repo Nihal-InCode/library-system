@@ -38,8 +38,11 @@ SEARCH_CONTEXT = {}  # {user_id: {"term": str, "page": int}}
 USER_PAGINATION_CONTEXT = {}  # {user_id: {"page": int}}
 ANALYTICS_CONTEXT = {}  # {user_id: {"type": str, "page": int}}
 LAST_BOT_MESSAGES = {}  # {user_id: message_id}
+DELETION_TASKS = {}  # {(chat_id, message_id): asyncio.Task}
 PAGE_SIZE = 5
 ANALYTICS_PAGE_SIZE = 10
+AUTO_DELETE_SECONDS = 300  # 5 minutes
+CLEANUP_CONTEXT = {}  # {user_id: {"menu_tap_id": int, "prompt_id": int}}
 
 # State constants
 CHOOSING = "CHOOSING"
@@ -61,19 +64,65 @@ def clear_user_state(user_id: int):
     """Clear state for user."""
     USER_STATES.pop(user_id, None)
 
+def store_menu_tap(user_id: int, message_id: int):
+    """Stores the message ID of a menu button tap."""
+    if user_id not in CLEANUP_CONTEXT:
+        CLEANUP_CONTEXT[user_id] = {"menu_tap_id": None, "prompt_id": None}
+    CLEANUP_CONTEXT[user_id]["menu_tap_id"] = message_id
+
+def store_prompt(user_id: int, message_id: int):
+    """Stores the message ID of a bot prompt."""
+    if user_id not in CLEANUP_CONTEXT:
+        CLEANUP_CONTEXT[user_id] = {"menu_tap_id": None, "prompt_id": None}
+    CLEANUP_CONTEXT[user_id]["prompt_id"] = message_id
+
+async def run_clean_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deletes stored menu tap, prompt, and current user input messages."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    
+    if user_id in CLEANUP_CONTEXT:
+        data = CLEANUP_CONTEXT[user_id]
+        if data["menu_tap_id"]:
+            await safe_delete_message(context, chat_id, data["menu_tap_id"])
+            data["menu_tap_id"] = None
+        if data["prompt_id"]:
+            await safe_delete_message(context, chat_id, data["prompt_id"])
+            data["prompt_id"] = None
+            
+    # Also delete the current user input message
+    if update.message:
+        await safe_delete_message(context, chat_id, update.message.message_id)
+
 # --- MESSAGE CLEANUP HELPERS ---
 
 async def safe_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
-    """Safely delete a message, ignoring errors."""
+    """Safely delete a message, ignoring errors and cancelling scheduled tasks."""
+    # Cancel any existing auto-delete task for this message
+    task = DELETION_TASKS.pop((chat_id, message_id), None)
+    if task:
+        task.cancel()
+        
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
     except Exception:
         pass
 
-async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int = 60):
+async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
     """Schedules a message for deletion after a delay."""
-    await asyncio.sleep(delay)
-    await safe_delete_message(context, chat_id, message_id)
+    try:
+        await asyncio.sleep(AUTO_DELETE_SECONDS)
+        # If we reach here, the task was not cancelled by navigation
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except asyncio.CancelledError:
+        # Task was cancelled (likely by navigation cleanup)
+        pass
+    except Exception:
+        # Message might already be deleted or other API error
+        pass
+    finally:
+        # Ensure cleanup from task tracking
+        DELETION_TASKS.pop((chat_id, message_id), None)
 
 async def send_and_track_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None, photo: bytes = None, reply_markup=None, parse_mode='Markdown', auto_delete: bool = True):
     """Sends a message, tracks it for immediate cleanup on next nav, and schedules auto-deletion."""
@@ -87,19 +136,26 @@ async def send_and_track_message(update: Update, context: ContextTypes.DEFAULT_T
 
     # 2. Send new message
     sent_msg = None
+    
+    # Add auto-delete warning if enabled
+    warning_text = f"\n\n⏳ _This message will auto-delete in {AUTO_DELETE_SECONDS // 60} minutes_"
+    display_text = text
+    if auto_delete and text:
+        display_text = f"{text}{warning_text}"
+
     try:
         if photo:
             sent_msg = await context.bot.send_photo(
                 chat_id=chat_id,
                 photo=photo,
-                caption=text,
+                caption=display_text,
                 reply_markup=reply_markup,
                 parse_mode=parse_mode
             )
         elif text:
             sent_msg = await context.bot.send_message(
                 chat_id=chat_id,
-                text=text,
+                text=display_text,
                 reply_markup=reply_markup,
                 parse_mode=parse_mode
             )
@@ -108,12 +164,13 @@ async def send_and_track_message(update: Update, context: ContextTypes.DEFAULT_T
         return None
 
     if sent_msg:
-        # 3. Track this message
+        # 3. Track this message for immediate cleanup on next navigation
         LAST_BOT_MESSAGES[user_id] = sent_msg.message_id
         
-        # 4. Schedule auto-deletion
+        # 4. Schedule auto-deletion task
         if auto_delete:
-            asyncio.create_task(schedule_message_deletion(context, chat_id, sent_msg.message_id))
+            task = asyncio.create_task(schedule_message_deletion(context, chat_id, sent_msg.message_id))
+            DELETION_TASKS[(chat_id, sent_msg.message_id)] = task
             
     return sent_msg
 
@@ -217,6 +274,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Start command received from user {user.id} ({user.full_name})")
     
     try:
+        await run_clean_chat(update, context)
         set_user_state(user.id, CHOOSING)
         await show_main_menu(update, context)
         logger.info(f"Main menu sent to user {user.id}")
@@ -230,6 +288,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     # Clear per-user state
+    await run_clean_chat(update, context)
     clear_user_state(user_id)
     SEARCH_CONTEXT.pop(user_id, None)
     USER_PAGINATION_CONTEXT.pop(user_id, None)
@@ -288,16 +347,19 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Routes the user choice from the main menu."""
+    await run_clean_chat(update, context)
     text = update.message.text
     user_id = update.effective_user.id
 
     # PUBLIC FEATURES (no authorization required)
     if text == "🔍 Find a Book":
-        await send_and_track_message(update, context, text="🔎 Please enter the *Book Code* or *Name* to search:", reply_markup=ReplyKeyboardRemove())
+        msg = await send_and_track_message(update, context, text="🔎 Please enter the *Book Code* or *Name* to search:", reply_markup=ReplyKeyboardRemove())
+        store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, SEARCHING_BOOK)
         
     elif text == "📖 Check Status":
-        await send_and_track_message(update, context, text="📖 Please enter the *Book Code* to check status:", reply_markup=ReplyKeyboardRemove())
+        msg = await send_and_track_message(update, context, text="📖 Please enter the *Book Code* to check status:", reply_markup=ReplyKeyboardRemove())
+        store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, CHECKING_STATUS)
         
     elif text == "📊 Library Stats":
@@ -348,7 +410,8 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ))
             set_user_state(user_id, CHOOSING)
             return
-        await send_and_track_message(update, context, text="👤 Please enter the *Student ID* or *Name*:", reply_markup=ReplyKeyboardRemove())
+        msg = await send_and_track_message(update, context, text="👤 Please enter the *Student ID* or *Name*:", reply_markup=ReplyKeyboardRemove())
+        store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, STUDENT_DETAILS)
         
     elif text == "🕘 Reading History":
@@ -360,7 +423,8 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ))
             set_user_state(user_id, CHOOSING)
             return
-        await send_and_track_message(update, context, text="🕘 Please enter the *Book Code* to view history:", reply_markup=ReplyKeyboardRemove())
+        msg = await send_and_track_message(update, context, text="🕘 Please enter the *Book Code* to view history:", reply_markup=ReplyKeyboardRemove())
+        store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, ISSUE_HISTORY)
     
     else:
@@ -803,11 +867,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_search_page(update, context, user_id, SEARCH_CONTEXT[user_id]["page"])
             
     elif data == "nav_search":
-        await send_and_track_message(update, context, text="🔎 Please enter *Book Code* or *Name*:", reply_markup=ReplyKeyboardRemove())
+        msg = await send_and_track_message(update, context, text="🔎 Please enter *Book Code* or *Name*:", reply_markup=ReplyKeyboardRemove())
+        store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, SEARCHING_BOOK)
         
     elif data == "nav_status":
-        await send_and_track_message(update, context, text="📖 Enter *Book Code*:", reply_markup=ReplyKeyboardRemove())
+        msg = await send_and_track_message(update, context, text="📖 Enter *Book Code*:", reply_markup=ReplyKeyboardRemove())
+        store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, CHECKING_STATUS)
         
     elif data == "nav_student":
@@ -816,7 +882,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_and_track_message(update, context, text="🚫 details restricted.")
             set_user_state(user_id, CHOOSING)
             return
-        await send_and_track_message(update, context, text="👤 Enter *Student ID* or *Name*:", reply_markup=ReplyKeyboardRemove())
+        msg = await send_and_track_message(update, context, text="👤 Enter *Student ID* or *Name*:", reply_markup=ReplyKeyboardRemove())
+        store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, STUDENT_DETAILS)
         
     elif data == "nav_history":
@@ -824,7 +891,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_and_track_message(update, context, text="🚫 history restricted.")
             set_user_state(user_id, CHOOSING)
             return
-        await send_and_track_message(update, context, text="🕘 Enter *Book Code*:", reply_markup=ReplyKeyboardRemove())
+        msg = await send_and_track_message(update, context, text="🕘 Enter *Book Code*:", reply_markup=ReplyKeyboardRemove())
+        store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, ISSUE_HISTORY)
 
     # 4. Bot Users Management
@@ -881,6 +949,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logger.info(f"Message from user {user_id} in state {current_state}: {update.message.text[:50]}")
     
+    # Clean Chat: If we are in an input state, clean up the previous menu tap, prompt, and current input
+    if current_state in [SEARCHING_BOOK, CHECKING_STATUS, STUDENT_DETAILS, ISSUE_HISTORY]:
+        await run_clean_chat(update, context)
+    elif current_state == CHOOSING:
+        # Store the menu button tap ID
+        store_menu_tap(user_id, update.message.message_id)
+
     try:
         if current_state == CHOOSING:
             await handle_choice(update, context)
