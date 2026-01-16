@@ -4,6 +4,21 @@ import asyncio
 import logging
 from datetime import datetime
 import time
+from typing import Set, Dict, Any, List, Tuple
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import base64
+
+# --- CONFIGURATION ---
+DB_PATH = "islamic_library.db"
+IMAGES_DIR = "images"
+
+# --- LOGGING ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 def get_db_connection():
     """Create a new SQLite connection for each request."""
     return sqlite3.connect(DB_PATH, timeout=10)
