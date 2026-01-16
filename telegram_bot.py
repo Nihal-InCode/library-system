@@ -225,6 +225,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_and_track_message(update, context, text="Sorry, an error occurred. Please try again.")
         clear_user_state(user.id)
 
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancels and ends the conversation."""
+    user_id = update.effective_user.id
+    
+    # Clear per-user state
+    clear_user_state(user_id)
+    SEARCH_CONTEXT.pop(user_id, None)
+    USER_PAGINATION_CONTEXT.pop(user_id, None)
+    ANALYTICS_CONTEXT.pop(user_id, None)
+    
+    await send_and_track_message(update, context, text="❌ Action cancelled. Back to main menu.", reply_markup=ReplyKeyboardRemove())
+    
+    # Return to main menu
+    await show_main_menu(update, context)
+    set_user_state(user_id, CHOOSING)
+    
+    # Return ConversationHandler.END for compatibility
+    from telegram.ext import ConversationHandler
+    return ConversationHandler.END
+
+async def handle_exit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exits the conversation."""
+    user_id = update.effective_user.id
+    await send_and_track_message(update, context, text="Session closed. Use /start to begin again.", reply_markup=ReplyKeyboardRemove())
+    clear_user_state(user_id)
+    SEARCH_CONTEXT.pop(user_id, None)
+    USER_PAGINATION_CONTEXT.pop(user_id, None)
+    ANALYTICS_CONTEXT.pop(user_id, None)
+
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Display the main menu buttons."""
     user_id = update.effective_user.id
