@@ -26,9 +26,33 @@ PORT = int(os.environ.get("PORT", "8080"))
 API_BASE = os.environ.get("API_BASE", f"http://127.0.0.1:{PORT}")
 
 # --- LOGGING ---
+class InMemoryLogHandler(logging.Handler):
+    def __init__(self, capacity=200):
+        super().__init__()
+        self.capacity = capacity
+        self.logs = []
+
+    def emit(self, record):
+        log_entry = {
+            "timestamp": datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S"),
+            "level": record.levelname,
+            "message": record.getMessage(),
+            "name": record.name
+        }
+        self.logs.append(log_entry)
+        if len(self.logs) > self.capacity:
+            self.logs.pop(0)
+
+    def get_logs(self, level=None):
+        if level:
+            return [l for l in self.logs if l["level"] == level]
+        return self.logs
+
+in_memory_logs = InMemoryLogHandler()
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    handlers=[logging.StreamHandler(), in_memory_logs]
 )
 logger = logging.getLogger(__name__)
 
@@ -37,12 +61,17 @@ USER_STATES = {}  # {user_id: state_name}
 SEARCH_CONTEXT = {}  # {user_id: {"term": str, "page": int}}
 USER_PAGINATION_CONTEXT = {}  # {user_id: {"page": int}}
 ANALYTICS_CONTEXT = {}  # {user_id: {"type": str, "page": int}}
-LAST_BOT_MESSAGES = {}  # {user_id: message_id}
+# --- CLEANUP CONFIGURATION ---
+MENU_TAP_DELETE_DELAY = 1
+PROMPT_TTL_SECONDS = 45
+INPUT_DELETE_DELAY = 1
+RESULT_TTL_SECONDS = 300
+
+CLEANUP_CONTEXT = {}  # {user_id: {"menu_tap_id": int, "prompt_id": int, "last_result_id": int}}
 DELETION_TASKS = {}  # {(chat_id, message_id): asyncio.Task}
+LAST_BOT_MESSAGES = {}  # {user_id: message_id} (Tracks last menu/prompt for replacement)
 PAGE_SIZE = 5
 ANALYTICS_PAGE_SIZE = 10
-AUTO_DELETE_SECONDS = 300  # 5 minutes
-CLEANUP_CONTEXT = {}  # {user_id: {"menu_tap_id": int, "prompt_id": int}}
 
 # State constants
 CHOOSING = "CHOOSING"
@@ -50,6 +79,9 @@ SEARCHING_BOOK = "SEARCHING_BOOK"
 CHECKING_STATUS = "CHECKING_STATUS"
 STUDENT_DETAILS = "STUDENT_DETAILS"
 ISSUE_HISTORY = "ISSUE_HISTORY"
+ADMIN_DASHBOARD = "ADMIN_DASHBOARD"
+ADMIN_RESET_USER = "ADMIN_RESET_USER"
+ADMIN_USER_HISTORY = "ADMIN_USER_HISTORY"
 
 # --- STATE HELPERS ---
 def get_user_state(user_id: int) -> str:
@@ -73,26 +105,27 @@ def store_menu_tap(user_id: int, message_id: int):
 def store_prompt(user_id: int, message_id: int):
     """Stores the message ID of a bot prompt."""
     if user_id not in CLEANUP_CONTEXT:
-        CLEANUP_CONTEXT[user_id] = {"menu_tap_id": None, "prompt_id": None}
+        CLEANUP_CONTEXT[user_id] = {"menu_tap_id": None, "prompt_id": None, "last_result_id": None}
     CLEANUP_CONTEXT[user_id]["prompt_id"] = message_id
 
 async def run_clean_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Deletes stored menu tap, prompt, and current user input messages."""
+    """Schedules deletion for stored menu tap, prompt, and current user input messages."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     
     if user_id in CLEANUP_CONTEXT:
         data = CLEANUP_CONTEXT[user_id]
         if data["menu_tap_id"]:
-            await safe_delete_message(context, chat_id, data["menu_tap_id"])
+            asyncio.create_task(schedule_message_deletion(context, chat_id, data["menu_tap_id"], MENU_TAP_DELETE_DELAY))
             data["menu_tap_id"] = None
         if data["prompt_id"]:
-            await safe_delete_message(context, chat_id, data["prompt_id"])
+            # Prompts stay for 45s unless explicitly cleared, but here we might want to clear them after input
+            asyncio.create_task(schedule_message_deletion(context, chat_id, data["prompt_id"], INPUT_DELETE_DELAY))
             data["prompt_id"] = None
             
-    # Also delete the current user input message
+    # Also delete the current user input message after a short delay
     if update.message:
-        await safe_delete_message(context, chat_id, update.message.message_id)
+        asyncio.create_task(schedule_message_deletion(context, chat_id, update.message.message_id, INPUT_DELETE_DELAY))
 
 # --- MESSAGE CLEANUP HELPERS ---
 
@@ -108,39 +141,35 @@ async def safe_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
     except Exception:
         pass
 
-async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
+async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int = RESULT_TTL_SECONDS):
     """Schedules a message for deletion after a delay."""
     try:
-        await asyncio.sleep(AUTO_DELETE_SECONDS)
-        # If we reach here, the task was not cancelled by navigation
+        await asyncio.sleep(delay)
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
     except asyncio.CancelledError:
-        # Task was cancelled (likely by navigation cleanup)
         pass
     except Exception:
-        # Message might already be deleted or other API error
         pass
     finally:
-        # Ensure cleanup from task tracking
         DELETION_TASKS.pop((chat_id, message_id), None)
 
-async def send_and_track_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None, photo: bytes = None, reply_markup=None, parse_mode='Markdown', auto_delete: bool = True):
-    """Sends a message, tracks it for immediate cleanup on next nav, and schedules auto-deletion."""
+async def send_and_track_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None, photo: bytes = None, reply_markup=None, parse_mode='Markdown', auto_delete: bool = True, delay: int = RESULT_TTL_SECONDS, is_result: bool = False, cleanup_previous: bool = True):
+    """Sends a message, tracks it, and schedules auto-deletion."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
-    # 1. Immediate cleanup of previous bot message for this user
-    if user_id in LAST_BOT_MESSAGES:
+    # 1. Immediate cleanup of previous bot message (only if it's NOT a result we want to keep)
+    if cleanup_previous and user_id in LAST_BOT_MESSAGES:
         await safe_delete_message(context, chat_id, LAST_BOT_MESSAGES[user_id])
         LAST_BOT_MESSAGES.pop(user_id)
 
     # 2. Send new message
     sent_msg = None
     
-    # Add auto-delete warning if enabled
-    warning_text = f"\n\n⏳ _This message will auto-delete in {AUTO_DELETE_SECONDS // 60} minutes_"
+    # Add auto-delete warning if it's a result or prompt (not for quick deletions)
     display_text = text
-    if auto_delete and text:
+    if auto_delete and text and delay >= 45:
+        warning_text = f"\n\n⏳ _This message will auto-delete in {delay // 60} minutes_" if delay >= 60 else f"\n\n⏳ _This message will auto-delete in {delay} seconds_"
         display_text = f"{text}{warning_text}"
 
     try:
@@ -164,12 +193,24 @@ async def send_and_track_message(update: Update, context: ContextTypes.DEFAULT_T
         return None
 
     if sent_msg:
-        # 3. Track this message for immediate cleanup on next navigation
-        LAST_BOT_MESSAGES[user_id] = sent_msg.message_id
+        # 3. Track this message
+        if is_result:
+            # Results are tracked separately so they don't get deleted by the next Menu/Prompt
+            if user_id not in CLEANUP_CONTEXT:
+                CLEANUP_CONTEXT[user_id] = {"menu_tap_id": None, "prompt_id": None, "last_result_id": None}
+            
+            # Delete previous result immediately if it exists (Keep only final result)
+            if CLEANUP_CONTEXT[user_id]["last_result_id"]:
+                await safe_delete_message(context, chat_id, CLEANUP_CONTEXT[user_id]["last_result_id"])
+            
+            CLEANUP_CONTEXT[user_id]["last_result_id"] = sent_msg.message_id
+        else:
+            # Menus and Prompts are tracked for immediate replacement
+            LAST_BOT_MESSAGES[user_id] = sent_msg.message_id
         
         # 4. Schedule auto-deletion task
         if auto_delete:
-            task = asyncio.create_task(schedule_message_deletion(context, chat_id, sent_msg.message_id))
+            task = asyncio.create_task(schedule_message_deletion(context, chat_id, sent_msg.message_id, delay))
             DELETION_TASKS[(chat_id, sent_msg.message_id)] = task
             
     return sent_msg
@@ -180,6 +221,33 @@ def is_admin(user_id: int) -> bool:
 
 def is_authorized(user_id: int) -> bool:
     return is_admin(user_id) or user_id in APPROVED_USERS
+
+async def log_user_action(user, action, details=""):
+    """Logs a user action to the backend audit trail."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(f"{API_BASE}/log_user_action", json={
+                "user_id": user.id,
+                "name": user.full_name,
+                "username": user.username,
+                "action": action,
+                "details": details
+            })
+    except Exception as e:
+        logger.error(f"Failed to log user action: {e}")
+
+async def log_admin_action(admin_id, action, target_user_id=None, details=""):
+    """Logs an admin action to the backend audit trail."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(f"{API_BASE}/log_admin_action", json={
+                "admin_id": admin_id,
+                "action": action,
+                "target_user_id": target_user_id,
+                "details": details
+            })
+    except Exception as e:
+        logger.error(f"Failed to log admin action: {e}")
 
 async def upsert_bot_user(user):
     """Update user's last active status and info in the DB."""
@@ -324,7 +392,8 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ["🔍 Find a Book", "📖 Check Status"],
             ["👤 Student Profile", "🕘 Reading History"],
             ["📊 Library Stats", "📊 Advanced Analytics"],
-            ["👥 Bot Users", "❌ Exit"]
+            ["👥 Bot Users", "👑 Admin Dashboard"],
+            ["❌ Exit"]
         ]
         msg = "👋 *Welcome to the Library Bot*\n_Please select an action below:_"
     else:
@@ -353,12 +422,12 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # PUBLIC FEATURES (no authorization required)
     if text == "🔍 Find a Book":
-        msg = await send_and_track_message(update, context, text="🔎 Please enter the *Book Code* or *Name* to search:", reply_markup=ReplyKeyboardRemove())
+        msg = await send_and_track_message(update, context, text="🔎 Please enter the *Book Code* or *Name* to search:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
         store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, SEARCHING_BOOK)
         
     elif text == "📖 Check Status":
-        msg = await send_and_track_message(update, context, text="📖 Please enter the *Book Code* to check status:", reply_markup=ReplyKeyboardRemove())
+        msg = await send_and_track_message(update, context, text="📖 Please enter the *Book Code* to check status:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
         store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, CHECKING_STATUS)
         
@@ -396,6 +465,13 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         USER_PAGINATION_CONTEXT[user_id] = {"page": 1}
         await send_bot_users_page(update, context, user_id, 1)
+
+    elif text == "👑 Admin Dashboard":
+        if not is_admin(user_id):
+            await send_and_track_message(update, context, text="🔒 *Admin Only*")
+            set_user_state(user_id, CHOOSING)
+            return
+        await show_admin_dashboard(update, context)
     
     elif text == "❌ Exit":
         await handle_exit(update, context)
@@ -410,7 +486,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ))
             set_user_state(user_id, CHOOSING)
             return
-        msg = await send_and_track_message(update, context, text="👤 Please enter the *Student ID* or *Name*:", reply_markup=ReplyKeyboardRemove())
+        msg = await send_and_track_message(update, context, text="👤 Please enter the *Student ID* or *Name*:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
         store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, STUDENT_DETAILS)
         
@@ -423,13 +499,27 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ))
             set_user_state(user_id, CHOOSING)
             return
-        msg = await send_and_track_message(update, context, text="🕘 Please enter the *Book Code* to view history:", reply_markup=ReplyKeyboardRemove())
+        msg = await send_and_track_message(update, context, text="🕘 Please enter the *Book Code* to view history:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
         store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, ISSUE_HISTORY)
     
-    else:
-        await send_and_track_message(update, context, text="⚠️ Unknown option. Please use the menu buttons.")
-        set_user_state(user_id, CHOOSING)
+async def show_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays the Quick Admin Dashboard."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("🧠 System Health", callback_data="admin_health")],
+        [InlineKeyboardButton("📜 Logs", callback_data="admin_logs")],
+        [InlineKeyboardButton("👤 User History", callback_data="admin_user_history")],
+        [InlineKeyboardButton("🛡 Admin Audit", callback_data="admin_audit")],
+        [InlineKeyboardButton("🔄 Reset User", callback_data="admin_reset")],
+        [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="nav_menu")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await send_and_track_message(update, context, text="👑 *Quick Admin Dashboard*\nSelect a management tool:", reply_markup=reply_markup)
+    set_user_state(user_id, ADMIN_DASHBOARD)
 
 async def handle_search_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Processes search book request and initializes pagination."""
@@ -438,6 +528,7 @@ async def handle_search_book(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     # Initialize search context
     SEARCH_CONTEXT[user_id] = {"term": term, "page": 1}
+    await log_user_action(update.effective_user, "Search Book", f"Term: {term}")
     
     await update.effective_chat.send_action(ChatAction.TYPING)
     await send_search_page(update, context, user_id, 1)
@@ -514,7 +605,7 @@ async def send_search_page(update: Update, context: ContextTypes.DEFAULT_TYPE, u
                 parse_mode='Markdown'
             )
         else:
-            await send_and_track_message(update, context, text=message_text, reply_markup=reply_markup)
+            await send_and_track_message(update, context, text=message_text, reply_markup=reply_markup, is_result=True)
             
     except Exception as e:
         logger.error(f"Error in send_search_page: {e}")
@@ -522,7 +613,7 @@ async def send_search_page(update: Update, context: ContextTypes.DEFAULT_TYPE, u
         if update.callback_query:
             await update.callback_query.edit_message_text(error_msg)
         else:
-            await send_and_track_message(update, context, text=error_msg)
+            await send_and_track_message(update, context, text=error_msg, is_result=True)
     
     set_user_state(user_id, CHOOSING)
 
@@ -530,6 +621,7 @@ async def handle_book_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Processes book status request."""
     user_id = update.effective_user.id
     book_id = update.message.text.strip().upper()
+    await log_user_action(update.effective_user, "Check Status", f"Book: {book_id}")
     
     await update.effective_chat.send_action(ChatAction.TYPING)
 
@@ -567,16 +659,17 @@ async def handle_book_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
             [InlineKeyboardButton("📖 Check Another", callback_data="nav_status"),
              InlineKeyboardButton("🔙 Main Menu", callback_data="nav_menu")]
         ]
-        await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
+        await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard), is_result=True)
     except Exception as e:
         logger.error(f"Error fetching book status: {e}")
-        await send_and_track_message(update, context, text="Failed to fetch book status. Please try again.")
+        await send_and_track_message(update, context, text="Failed to fetch book status. Please try again.", is_result=True)
     set_user_state(user_id, CHOOSING)
 
 async def handle_student_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Processes student details request."""
     user_id = update.effective_user.id
     student_id = update.message.text.strip()
+    await log_user_action(update.effective_user, "View Student Profile", f"Student: {student_id}")
     
     await update.effective_chat.send_action(ChatAction.TYPING)
 
@@ -641,7 +734,7 @@ async def handle_student_details(update: Update, context: ContextTypes.DEFAULT_T
             [InlineKeyboardButton("🔙 Main Menu", callback_data="nav_menu")]
         ]
         
-        await send_and_track_message(update, context, text=msg, photo=photo_bytes, reply_markup=InlineKeyboardMarkup(keyboard))
+        await send_and_track_message(update, context, text=msg, photo=photo_bytes, reply_markup=InlineKeyboardMarkup(keyboard), is_result=True)
     except Exception as e:
         logger.error(f"Error fetching student details: {e}")
         await send_and_track_message(update, context, text="Failed to fetch student details. Please try again.")
@@ -651,6 +744,7 @@ async def handle_issue_history(update: Update, context: ContextTypes.DEFAULT_TYP
     """Processes issue history for a book."""
     user_id = update.effective_user.id
     book_id = update.message.text.strip().upper()
+    await log_user_action(update.effective_user, "View Issue History", f"Book: {book_id}")
     
     await update.effective_chat.send_action(ChatAction.TYPING)
 
@@ -683,7 +777,7 @@ async def handle_issue_history(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
             
             keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="nav_menu")]]
-            await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
+            await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard), is_result=True)
     except Exception as e:
         logger.error(f"Error fetching issue history: {e}")
         await send_and_track_message(update, context, text="Failed to fetch history. Please try again.")
@@ -691,6 +785,7 @@ async def handle_issue_history(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def handle_book_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Displays aggregate book counts."""
+    await log_user_action(update.effective_user, "View Library Stats")
     await update.effective_chat.send_action(ChatAction.TYPING)
     
     try:
@@ -711,7 +806,7 @@ async def handle_book_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📖 *Currently Issued:* {stats['issued_books']}\n\n"
             f"_Data accurate as of {stats['timestamp']}_"
         )
-        await send_and_track_message(update, context, text=msg)
+        await send_and_track_message(update, context, text=msg, is_result=True)
     except Exception as e:
         logger.error(f"Error fetching library stats: {e}")
         await send_and_track_message(update, context, text="Failed to fetch library stats. Please try again.")
@@ -743,6 +838,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             APPROVED_USERS.add(target_id)
             logger.info(f"Admin approved user {target_id}")
+            await log_admin_action(user_id, "Approve User", target_id)
             
             # Update Admin Message
             try:
@@ -780,6 +876,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
         elif data.startswith("decline_"):
             logger.info(f"Admin declined user {target_id}")
+            await log_admin_action(user_id, "Decline User", target_id)
             
             # Update Admin Message
             try:
@@ -814,6 +911,57 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         return
 
+        return
+    
+    # 5. Admin Dashboard Actions
+    if data.startswith("admin_"):
+        if not is_admin(user_id):
+            await query.answer("🔒 Admin only", show_alert=True)
+            return
+
+        if data == "admin_health":
+            await show_admin_health(update, context)
+        elif data == "admin_logs":
+            await show_admin_logs(update, context, "ERROR", 1)
+        elif data == "admin_user_history":
+            await send_and_track_message(update, context, text="👤 Please enter the *User ID* to view history:", reply_markup=ReplyKeyboardRemove())
+            set_user_state(user_id, ADMIN_USER_HISTORY)
+        elif data == "admin_audit":
+            await show_admin_audit(update, context, "all", 1)
+        elif data == "admin_reset":
+            await send_and_track_message(update, context, text="🔄 Please enter the *User ID* to reset their session:", reply_markup=ReplyKeyboardRemove())
+            set_user_state(user_id, ADMIN_RESET_USER)
+        elif data == "admin_dash":
+            await show_admin_dashboard(update, context)
+        return
+
+    # 6. Admin Log Navigation
+    if data.startswith("log_"):
+        # log_{level}_{page}
+        parts = data.split("_")
+        level = parts[1]
+        page = int(parts[2])
+        await show_admin_logs(update, context, level, page)
+        return
+
+    # 7. Admin Audit Navigation
+    if data.startswith("audit_"):
+        # audit_{filter}_{page}
+        parts = data.split("_")
+        filter_type = parts[1]
+        page = int(parts[2])
+        await show_admin_audit(update, context, filter_type, page)
+        return
+
+    # 8. User History Navigation
+    if data.startswith("uhist_"):
+        # uhist_{target_id}_{page}
+        parts = data.split("_")
+        target_id = int(parts[1])
+        page = int(parts[2])
+        await show_user_history(update, context, target_id, page)
+        return
+
     # 3. Analytics Actions
     if data.startswith("ana_"):
         if not is_admin(user_id):
@@ -845,6 +993,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Initial analytics call
         ana_type = data # e.g., ana_most
+        await log_user_action(update.effective_user, "View Analytics", f"Type: {ana_type}")
         ANALYTICS_CONTEXT[user_id] = {"type": ana_type, "page": 1}
         await send_analytics_page(update, context, user_id)
         return
@@ -867,12 +1016,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_search_page(update, context, user_id, SEARCH_CONTEXT[user_id]["page"])
             
     elif data == "nav_search":
-        msg = await send_and_track_message(update, context, text="🔎 Please enter *Book Code* or *Name*:", reply_markup=ReplyKeyboardRemove())
+        msg = await send_and_track_message(update, context, text="🔎 Please enter *Book Code* or *Name*:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
         store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, SEARCHING_BOOK)
         
     elif data == "nav_status":
-        msg = await send_and_track_message(update, context, text="📖 Enter *Book Code*:", reply_markup=ReplyKeyboardRemove())
+        msg = await send_and_track_message(update, context, text="📖 Enter *Book Code*:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
         store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, CHECKING_STATUS)
         
@@ -882,7 +1031,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_and_track_message(update, context, text="🚫 details restricted.")
             set_user_state(user_id, CHOOSING)
             return
-        msg = await send_and_track_message(update, context, text="👤 Enter *Student ID* or *Name*:", reply_markup=ReplyKeyboardRemove())
+        msg = await send_and_track_message(update, context, text="👤 Enter *Student ID* or *Name*:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
         store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, STUDENT_DETAILS)
         
@@ -891,7 +1040,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_and_track_message(update, context, text="🚫 history restricted.")
             set_user_state(user_id, CHOOSING)
             return
-        msg = await send_and_track_message(update, context, text="🕘 Enter *Book Code*:", reply_markup=ReplyKeyboardRemove())
+        msg = await send_and_track_message(update, context, text="🕘 Enter *Book Code*:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
         store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, ISSUE_HISTORY)
 
@@ -953,8 +1102,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if current_state in [SEARCHING_BOOK, CHECKING_STATUS, STUDENT_DETAILS, ISSUE_HISTORY]:
         await run_clean_chat(update, context)
     elif current_state == CHOOSING:
-        # Store the menu button tap ID
+        # Store the menu button tap ID and schedule its deletion
         store_menu_tap(user_id, update.message.message_id)
+        asyncio.create_task(schedule_message_deletion(context, update.effective_chat.id, update.message.message_id, MENU_TAP_DELETE_DELAY))
 
     try:
         if current_state == CHOOSING:
@@ -967,6 +1117,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_student_details(update, context)
         elif current_state == ISSUE_HISTORY:
             await handle_issue_history(update, context)
+        elif current_state == ADMIN_RESET_USER:
+            await handle_admin_reset_user(update, context)
+        elif current_state == ADMIN_USER_HISTORY:
+            try:
+                target_id = int(update.message.text.strip())
+                await show_user_history(update, context, target_id, 1)
+            except ValueError:
+                await send_and_track_message(update, context, text="❌ Invalid User ID.")
+                await show_admin_dashboard(update, context)
         else:
             # Unknown state, reset to CHOOSING
             logger.warning(f"Unknown state {current_state} for user {user_id}, resetting to CHOOSING")
@@ -1027,7 +1186,7 @@ async def send_bot_users_page(update: Update, context: ContextTypes.DEFAULT_TYPE
         if update.callback_query:
             await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         else:
-            await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
+            await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard), is_result=True)
             
     except Exception as e:
         logger.error(f"Error in send_bot_users_page: {e}")
@@ -1098,6 +1257,7 @@ async def update_user_role_api(update: Update, context: ContextTypes.DEFAULT_TYP
             
         if res_data["status"] == "ok":
             await update.callback_query.answer(f"✅ Role updated to {role}")
+            await log_admin_action(admin_id, "Change Role", target_id, f"New role: {role}")
             # If approved, update the in-memory set for immediate effect
             if role == "Approved":
                 APPROVED_USERS.add(target_id)
@@ -1110,6 +1270,197 @@ async def update_user_role_api(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         logger.error(f"Error in update_user_role_api: {e}")
         await update.callback_query.answer("❌ API Error")
+
+async def show_admin_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows system health dashboard."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{API_BASE}/health")
+            data = response.json()
+        
+        status = "✅ OK" if data["status"] == "ok" else "❌ FAIL"
+        db_status = "✅ Present" if data["database_present"] else "❌ Missing"
+        
+        msg = (
+            f"🧠 *System Health Dashboard*\n\n"
+            f"🤖 *Bot Status:* Running\n"
+            f"⚙️ *Backend Status:* {status}\n"
+            f"📁 *Database File:* {db_status}\n"
+            f"🕒 *Timestamp:* {data['timestamp']}\n"
+            f"🔌 *Port:* {data['port']}\n"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("🔄 Refresh", callback_data="admin_health")],
+            [InlineKeyboardButton("🔙 Back to Dashboard", callback_data="admin_dash")]
+        ]
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        else:
+            await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception as e:
+        logger.error(f"Error in show_admin_health: {e}")
+        await send_and_track_message(update, context, text="❌ Failed to fetch health status.")
+
+async def show_admin_logs(update: Update, context: ContextTypes.DEFAULT_TYPE, level: str, page: int):
+    """Shows in-memory logs with pagination."""
+    logs = in_memory_logs.get_logs(level)
+    logs.reverse() # Show newest first
+    
+    page_size = 10
+    total_pages = (len(logs) + page_size - 1) // page_size if logs else 1
+    start_idx = (page - 1) * page_size
+    end_idx = start_idx + page_size
+    page_logs = logs[start_idx:end_idx]
+    
+    msg = f"📜 *System Logs* ({level})\nPage {page}/{total_pages}\n\n"
+    if not page_logs:
+        msg += "_No logs found._"
+    else:
+        for l in page_logs:
+            msg += f"🕒 `{l['timestamp']}`\n`{l['level']}`: {l['message'][:100]}\n\n"
+            
+    keyboard = []
+    nav_row = []
+    if page > 1:
+        nav_row.append(InlineKeyboardButton("⏮ Prev", callback_data=f"log_{level}_{page-1}"))
+    if page < total_pages:
+        nav_row.append(InlineKeyboardButton("⏭ Next", callback_data=f"log_{level}_{page+1}"))
+    if nav_row:
+        keyboard.append(nav_row)
+        
+    keyboard.append([
+        InlineKeyboardButton("❗ Errors", callback_data="log_ERROR_1"),
+        InlineKeyboardButton("⚠️ Warnings", callback_data="log_WARNING_1")
+    ])
+    keyboard.append([InlineKeyboardButton("🔙 Back to Dashboard", callback_data="admin_dash")])
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    else:
+        await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def show_admin_audit(update: Update, context: ContextTypes.DEFAULT_TYPE, filter_type: str, page: int):
+    """Shows admin action audit log."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(f"{API_BASE}/get_admin_actions", json={"page": page, "filter": filter_type})
+            res_data = response.json()
+            
+        if res_data["status"] != "ok":
+            await send_and_track_message(update, context, text="❌ Error fetching audit log.")
+            return
+
+        actions = res_data["data"]
+        msg = f"🛡 *Admin Audit Log* ({filter_type.capitalize()})\n\n"
+        
+        if not actions:
+            msg += "_No actions recorded._"
+        else:
+            for a in actions:
+                target = f" (User: `{a['target_user_id']}`)" if a['target_user_id'] else ""
+                msg += f"🕒 `{a['created_at']}`\n⚡ *{a['action']}*{target}\n📝 {a['details']}\n\n"
+                
+        keyboard = []
+        nav_row = []
+        if page > 1:
+            nav_row.append(InlineKeyboardButton("⏮ Prev", callback_data=f"audit_{filter_type}_{page-1}"))
+        if len(actions) == 10:
+            nav_row.append(InlineKeyboardButton("⏭ Next", callback_data=f"audit_{filter_type}_{page+1}"))
+        if nav_row:
+            keyboard.append(nav_row)
+            
+        keyboard.append([
+            InlineKeyboardButton("All", callback_data="audit_all_1"),
+            InlineKeyboardButton("Access", callback_data="audit_access_1"),
+            InlineKeyboardButton("Resets", callback_data="audit_reset_1")
+        ])
+        keyboard.append([InlineKeyboardButton("🔙 Back to Dashboard", callback_data="admin_dash")])
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        else:
+            await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception as e:
+        logger.error(f"Error in show_admin_audit: {e}")
+        await send_and_track_message(update, context, text="❌ Failed to load audit log.")
+
+async def show_user_history(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int, page: int = 1):
+    """Shows action history for a specific user."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(f"{API_BASE}/get_user_actions", json={"user_id": target_id, "page": page})
+            res_data = response.json()
+            
+        if res_data["status"] != "ok":
+            await send_and_track_message(update, context, text="❌ Error fetching user history.")
+            return
+
+        actions = res_data["data"]
+        msg = f"� *User Action History* (`{target_id}`)\n\n"
+        
+        if not actions:
+            msg += "_No actions found for this user._"
+        else:
+            for a in actions:
+                msg += f"🕒 `{a['created_at']}`\n⚡ *{a['action']}*\n📝 {a['details']}\n\n"
+                
+        keyboard = []
+        nav_row = []
+        if page > 1:
+            nav_row.append(InlineKeyboardButton("⏮ Prev", callback_data=f"uhist_{target_id}_{page-1}"))
+        if len(actions) == 10:
+            nav_row.append(InlineKeyboardButton("⏭ Next", callback_data=f"uhist_{target_id}_{page+1}"))
+        if nav_row:
+            keyboard.append(nav_row)
+            
+        keyboard.append([InlineKeyboardButton("🔙 Back to Dashboard", callback_data="admin_dash")])
+        
+        await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception as e:
+        logger.error(f"Error in show_user_history: {e}")
+        await send_and_track_message(update, context, text="❌ Failed to load user history.")
+
+async def handle_admin_reset_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Resets a user's session and state."""
+    admin_id = update.effective_user.id
+    try:
+        target_id = int(update.message.text.strip())
+        
+        # 1. Clear State
+        USER_STATES.pop(target_id, None)
+        SEARCH_CONTEXT.pop(target_id, None)
+        USER_PAGINATION_CONTEXT.pop(target_id, None)
+        ANALYTICS_CONTEXT.pop(target_id, None)
+        
+        # 2. Cancel Deletion Tasks
+        for key in list(DELETION_TASKS.keys()):
+            if key[0] == target_id:
+                task = DELETION_TASKS.pop(key)
+                task.cancel()
+        
+        # 3. Notify User
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text="🔄 *Session Reset*\nYour session has been reset by an administrator. Please use /start to begin again.",
+                parse_mode='Markdown'
+            )
+        except Exception:
+            pass # User might have blocked the bot
+            
+        # 4. Log Action
+        await log_admin_action(admin_id, "Reset User Session", target_id, "Cleared state and cancelled tasks.")
+        
+        await send_and_track_message(update, context, text=f"✅ *User {target_id} Reset*\nSession cleared and user notified.")
+        await show_admin_dashboard(update, context)
+        
+    except ValueError:
+        await send_and_track_message(update, context, text="❌ Invalid User ID. Please enter a numeric ID.")
+    except Exception as e:
+        logger.error(f"Error in handle_admin_reset_user: {e}")
+        await send_and_track_message(update, context, text="❌ Failed to reset user.")
 
 async def send_analytics_page(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
     """Fetches and displays a specific page of analytics."""

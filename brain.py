@@ -429,9 +429,31 @@ def init_bot_users_db():
                 approved_by INTEGER
             )
         """)
+        # Audit Tables
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bot_user_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                name TEXT,
+                username TEXT,
+                action TEXT,
+                details TEXT,
+                created_at TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bot_admin_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER,
+                action TEXT,
+                target_user_id INTEGER,
+                details TEXT,
+                created_at TEXT
+            )
+        """)
         conn.commit()
     except Exception as e:
-        logger.error(f"Error initializing bot_users table: {e}")
+        logger.error(f"Error initializing audit tables: {e}")
     finally:
         conn.close()
 
@@ -575,9 +597,132 @@ def health():
     """Health check endpoint."""
     return jsonify({
         "status": "ok",
-        "timestamp": datetime.now().isoformat(),
-        "database": os.path.exists(DB_PATH)
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "database_present": os.path.exists(DB_PATH),
+        "db_path": DB_PATH,
+        "port": int(os.environ.get("PORT", 5000))
     })
+
+@app.route('/log_user_action', methods=['POST'])
+def log_user_action():
+    """Log a user action to the audit trail."""
+    try:
+        data = request.get_json()
+        user_id = data.get('user_id')
+        name = data.get('name')
+        username = data.get('username')
+        action = data.get('action')
+        details = data.get('details', '')
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO bot_user_actions (user_id, name, username, action, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (user_id, name, username, action, details, now))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        logger.error(f"Error logging user action: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/get_user_actions', methods=['POST'])
+def get_user_actions():
+    """Retrieve paginated user actions."""
+    try:
+        data = request.get_json()
+        page = data.get('page', 1)
+        page_size = data.get('page_size', 10)
+        user_id = data.get('user_id') # Optional filter
+        
+        query = "SELECT * FROM bot_user_actions"
+        params = []
+        if user_id:
+            query += " WHERE user_id = ?"
+            params.append(user_id)
+        
+        query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        params.extend([page_size, (page - 1) * page_size])
+        
+        results = query_db(query, tuple(params))
+        actions = []
+        for r in results:
+            actions.append({
+                "id": r[0],
+                "user_id": r[1],
+                "name": r[2],
+                "username": r[3],
+                "action": r[4],
+                "details": r[5],
+                "created_at": r[6]
+            })
+            
+        return jsonify({"status": "ok", "data": actions})
+    except Exception as e:
+        logger.error(f"Error getting user actions: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/log_admin_action', methods=['POST'])
+def log_admin_action():
+    """Log an admin action to the audit trail."""
+    try:
+        data = request.get_json()
+        admin_id = data.get('admin_id')
+        action = data.get('action')
+        target_user_id = data.get('target_user_id')
+        details = data.get('details', '')
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO bot_admin_actions (admin_id, action, target_user_id, details, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (admin_id, action, target_user_id, details, now))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        logger.error(f"Error logging admin action: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/get_admin_actions', methods=['POST'])
+def get_admin_actions():
+    """Retrieve paginated admin actions."""
+    try:
+        data = request.get_json()
+        page = data.get('page', 1)
+        page_size = data.get('page_size', 10)
+        filter_type = data.get('filter') # Optional filter
+        
+        query = "SELECT * FROM bot_admin_actions"
+        params = []
+        if filter_type == 'access':
+            query += " WHERE action IN ('Approve User', 'Decline User', 'Change Role')"
+        elif filter_type == 'reset':
+            query += " WHERE action = 'Reset User Session'"
+            
+        query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        params.extend([page_size, (page - 1) * page_size])
+        
+        results = query_db(query, tuple(params))
+        actions = []
+        for r in results:
+            actions.append({
+                "id": r[0],
+                "admin_id": r[1],
+                "action": r[2],
+                "target_user_id": r[3],
+                "details": r[4],
+                "created_at": r[5]
+            })
+            
+        return jsonify({"status": "ok", "data": actions})
+    except Exception as e:
+        logger.error(f"Error getting admin actions: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 # --- ERROR HANDLERS ---
 @app.errorhandler(404)
