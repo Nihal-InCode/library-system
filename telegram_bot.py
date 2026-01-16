@@ -5,6 +5,8 @@ from datetime import datetime
 from typing import Set, Dict, Any
 import httpx
 import base64
+import sqlite3
+import shutil
 
 # For python-telegram-bot v20+
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
@@ -24,6 +26,7 @@ ADMIN_CHAT_ID = 8291437833
 APPROVED_USERS: Set[int] = {ADMIN_CHAT_ID}  # Admin is always approved
 PORT = int(os.environ.get("PORT", "8080"))
 API_BASE = os.environ.get("API_BASE", f"http://127.0.0.1:{PORT}")
+DB_PATH = "islamic_library.db"
 
 # --- LOGGING ---
 class InMemoryLogHandler(logging.Handler):
@@ -62,9 +65,11 @@ SEARCH_CONTEXT = {}  # {user_id: {"term": str, "page": int}}
 USER_PAGINATION_CONTEXT = {}  # {user_id: {"page": int}}
 ANALYTICS_CONTEXT = {}  # {user_id: {"type": str, "page": int}}
 # --- CLEANUP CONFIGURATION ---
-MENU_TAP_DELETE_DELAY = 1
+DELETE_VISIBLE_SECONDS = 5
+VANISH_ANIMATION_SECONDS = 2
+MENU_TAP_DELETE_DELAY = DELETE_VISIBLE_SECONDS
 PROMPT_TTL_SECONDS = 45
-INPUT_DELETE_DELAY = 1
+INPUT_DELETE_DELAY = DELETE_VISIBLE_SECONDS
 RESULT_TTL_SECONDS = 300
 
 CLEANUP_CONTEXT = {}  # {user_id: {"menu_tap_id": int, "prompt_id": int, "last_result_id": int}}
@@ -82,6 +87,8 @@ ISSUE_HISTORY = "ISSUE_HISTORY"
 ADMIN_DASHBOARD = "ADMIN_DASHBOARD"
 ADMIN_RESET_USER = "ADMIN_RESET_USER"
 ADMIN_USER_HISTORY = "ADMIN_USER_HISTORY"
+ADMIN_DB_TOOLS = "ADMIN_DB_TOOLS"
+ADMIN_DB_UPLOAD = "ADMIN_DB_UPLOAD"
 
 # --- STATE HELPERS ---
 def get_user_state(user_id: int) -> str:
@@ -116,16 +123,19 @@ async def run_clean_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in CLEANUP_CONTEXT:
         data = CLEANUP_CONTEXT[user_id]
         if data["menu_tap_id"]:
-            asyncio.create_task(schedule_message_deletion(context, chat_id, data["menu_tap_id"], MENU_TAP_DELETE_DELAY))
+            task = asyncio.create_task(schedule_message_deletion(context, chat_id, data["menu_tap_id"], MENU_TAP_DELETE_DELAY, show_vanish=True))
+            DELETION_TASKS[(chat_id, data["menu_tap_id"])] = task
             data["menu_tap_id"] = None
         if data["prompt_id"]:
             # Prompts stay for 45s unless explicitly cleared, but here we might want to clear them after input
-            asyncio.create_task(schedule_message_deletion(context, chat_id, data["prompt_id"], INPUT_DELETE_DELAY))
+            task = asyncio.create_task(schedule_message_deletion(context, chat_id, data["prompt_id"], INPUT_DELETE_DELAY, show_vanish=True))
+            DELETION_TASKS[(chat_id, data["prompt_id"])] = task
             data["prompt_id"] = None
             
     # Also delete the current user input message after a short delay
     if update.message:
-        asyncio.create_task(schedule_message_deletion(context, chat_id, update.message.message_id, INPUT_DELETE_DELAY))
+        task = asyncio.create_task(schedule_message_deletion(context, chat_id, update.message.message_id, INPUT_DELETE_DELAY, show_vanish=True))
+        DELETION_TASKS[(chat_id, update.message.message_id)] = task
 
 # --- MESSAGE CLEANUP HELPERS ---
 
@@ -141,17 +151,33 @@ async def safe_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
     except Exception:
         pass
 
-async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int = RESULT_TTL_SECONDS):
-    """Schedules a message for deletion after a delay."""
+async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int = RESULT_TTL_SECONDS, show_vanish: bool = False):
+    """Schedules a message for deletion after a delay, optionally with a vanish animation."""
     try:
         await asyncio.sleep(delay)
+        
+        if show_vanish:
+            # Powder vanishing animation (only works for bot messages)
+            frames = ["🫧 Vanishing in 2…", "✨ Vanishing in 1…", "💨 …"]
+            frame_delay = VANISH_ANIMATION_SECONDS / len(frames)
+            for frame in frames:
+                try:
+                    # Try to edit. This will fail for user messages, which is fine.
+                    await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=frame)
+                except Exception:
+                    # If edit fails, we just wait the time anyway to maintain the delay
+                    pass
+                await asyncio.sleep(frame_delay)
+        
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
     except asyncio.CancelledError:
         pass
     except Exception:
         pass
     finally:
-        DELETION_TASKS.pop((chat_id, message_id), None)
+        # Only pop if it's still our task
+        if DELETION_TASKS.get((chat_id, message_id)) == asyncio.current_task():
+            DELETION_TASKS.pop((chat_id, message_id), None)
 
 async def send_and_track_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None, photo: bytes = None, reply_markup=None, parse_mode='Markdown', auto_delete: bool = True, delay: int = RESULT_TTL_SECONDS, is_result: bool = False, cleanup_previous: bool = True):
     """Sends a message, tracks it, and schedules auto-deletion."""
@@ -210,7 +236,9 @@ async def send_and_track_message(update: Update, context: ContextTypes.DEFAULT_T
         
         # 4. Schedule auto-deletion task
         if auto_delete:
-            task = asyncio.create_task(schedule_message_deletion(context, chat_id, sent_msg.message_id, delay))
+            # Vanish only for non-results (prompts/menus)
+            vanish = not is_result
+            task = asyncio.create_task(schedule_message_deletion(context, chat_id, sent_msg.message_id, delay, show_vanish=vanish))
             DELETION_TASKS[(chat_id, sent_msg.message_id)] = task
             
     return sent_msg
@@ -515,11 +543,33 @@ async def show_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("👤 User History", callback_data="admin_user_history")],
         [InlineKeyboardButton("🛡 Admin Audit", callback_data="admin_audit")],
         [InlineKeyboardButton("🔄 Reset User", callback_data="admin_reset")],
-        [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="nav_menu")]
+        [InlineKeyboardButton("� DB Tools", callback_data="admin_db")],
+        [InlineKeyboardButton("�🔙 Back to Main Menu", callback_data="nav_menu")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await send_and_track_message(update, context, text="👑 *Quick Admin Dashboard*\nSelect a management tool:", reply_markup=reply_markup)
     set_user_state(user_id, ADMIN_DASHBOARD)
+
+async def show_admin_db_tools(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays the Database Management menu."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("⬇️ Download Database", callback_data="admin_export")],
+        [InlineKeyboardButton("⬆️ Upload Database", callback_data="admin_import")],
+        [InlineKeyboardButton("🔙 Back to Dashboard", callback_data="admin_dash")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    msg = "🗄 *Database Management*\n\nExport or Import the library database file."
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
+    else:
+        await send_and_track_message(update, context, text=msg, reply_markup=reply_markup)
+    
+    set_user_state(user_id, ADMIN_DB_TOOLS)
 
 async def handle_search_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Processes search book request and initializes pagination."""
@@ -933,6 +983,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_user_state(user_id, ADMIN_RESET_USER)
         elif data == "admin_dash":
             await show_admin_dashboard(update, context)
+        elif data == "admin_db":
+            await show_admin_db_tools(update, context)
+        elif data == "admin_export":
+            await handle_db_export(update, context)
+        elif data == "admin_import":
+            await handle_db_import_confirm(update, context)
+        elif data == "admin_import_confirm":
+            await send_and_track_message(update, context, text="⬆️ *Upload Database*\n\nPlease upload the `.db` file as a document.", reply_markup=ReplyKeyboardRemove())
+            set_user_state(user_id, ADMIN_DB_UPLOAD)
         return
 
     # 6. Admin Log Navigation
@@ -1096,7 +1155,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     current_state = get_user_state(user_id)
     
-    logger.info(f"Message from user {user_id} in state {current_state}: {update.message.text[:50]}")
+    msg_text = update.message.text or ""
+    logger.info(f"Message from user {user_id} in state {current_state}: {msg_text[:50]}")
     
     # Clean Chat: If we are in an input state, clean up the previous menu tap, prompt, and current input
     if current_state in [SEARCHING_BOOK, CHECKING_STATUS, STUDENT_DETAILS, ISSUE_HISTORY]:
@@ -1104,7 +1164,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif current_state == CHOOSING:
         # Store the menu button tap ID and schedule its deletion
         store_menu_tap(user_id, update.message.message_id)
-        asyncio.create_task(schedule_message_deletion(context, update.effective_chat.id, update.message.message_id, MENU_TAP_DELETE_DELAY))
+        task = asyncio.create_task(schedule_message_deletion(context, update.effective_chat.id, update.message.message_id, MENU_TAP_DELETE_DELAY, show_vanish=True))
+        DELETION_TASKS[(update.effective_chat.id, update.message.message_id)] = task
 
     try:
         if current_state == CHOOSING:
@@ -1126,6 +1187,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except ValueError:
                 await send_and_track_message(update, context, text="❌ Invalid User ID.")
                 await show_admin_dashboard(update, context)
+        elif current_state == ADMIN_DB_UPLOAD:
+            if update.message.document:
+                await handle_db_file_upload(update, context)
+            else:
+                await send_and_track_message(update, context, text="⚠️ Please upload a `.db` file as a document.")
         else:
             # Unknown state, reset to CHOOSING
             logger.warning(f"Unknown state {current_state} for user {user_id}, resetting to CHOOSING")
@@ -1146,7 +1212,7 @@ def init_bot():
     # Add simple handlers instead of ConversationHandler
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('cancel', cancel))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_callback))
     
     return application
@@ -1461,6 +1527,108 @@ async def handle_admin_reset_user(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         logger.error(f"Error in handle_admin_reset_user: {e}")
         await send_and_track_message(update, context, text="❌ Failed to reset user.")
+
+async def handle_db_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exports the database file to the admin."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+
+    if not os.path.exists(DB_PATH):
+        await send_and_track_message(update, context, text="❌ Database file not found.")
+        return
+
+    try:
+        await update.effective_chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+        with open(DB_PATH, 'rb') as f:
+            await context.bot.send_document(
+                chat_id=user_id,
+                document=f,
+                filename=f"library_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db",
+                caption="✅ *Database Exported Successfully*"
+            )
+        await log_admin_action(user_id, "DB_EXPORT", details=f"File: {DB_PATH}")
+    except Exception as e:
+        logger.error(f"Error exporting database: {e}")
+        await send_and_track_message(update, context, text="❌ Failed to export database.")
+
+async def handle_db_import_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Asks for confirmation before database import."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Continue", callback_data="admin_import_confirm")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="admin_db")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    msg = (
+        "⚠️ *WARNING: Database Import*\n\n"
+        "Uploading a new database will *REPLACE* all current data.\n"
+        "This action is irreversible (though a backup will be created).\n\n"
+        "Do you want to continue?"
+    )
+    await update.callback_query.edit_message_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
+
+async def handle_db_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Processes the uploaded database file."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+
+    doc = update.message.document
+    if not doc.file_name.endswith('.db'):
+        await send_and_track_message(update, context, text="❌ Invalid file type. Please upload a `.db` file.")
+        return
+
+    if doc.file_size > 50 * 1024 * 1024: # 50MB limit
+        await send_and_track_message(update, context, text="❌ File too large. Maximum size is 50MB.")
+        return
+
+    temp_path = "temp_import.db"
+    backup_path = f"{DB_PATH}.bak_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    try:
+        # 1. Download file
+        await update.effective_chat.send_action(ChatAction.TYPING)
+        new_file = await context.bot.get_file(doc.file_id)
+        await new_file.download_to_drive(temp_path)
+
+        # 2. Validate SQLite and Tables
+        conn = sqlite3.connect(temp_path)
+        cursor = conn.cursor()
+        required_tables = {'books', 'members', 'transactions'}
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        existing_tables = {row[0] for row in cursor.fetchall()}
+        conn.close()
+
+        if not required_tables.issubset(existing_tables):
+            missing = required_tables - existing_tables
+            os.remove(temp_path)
+            await send_and_track_message(update, context, text=f"❌ Invalid database schema. Missing tables: {', '.join(missing)}")
+            return
+
+        # 3. Atomic Replace with Backup
+        if os.path.exists(DB_PATH):
+            shutil.copy2(DB_PATH, backup_path)
+        
+        try:
+            shutil.move(temp_path, DB_PATH)
+            await send_and_track_message(update, context, text="✅ *Database Replaced Successfully*\nThe library data has been updated.")
+            await log_admin_action(user_id, "DB_IMPORT", details=f"File: {doc.file_name}, Size: {doc.file_size}")
+            set_user_state(user_id, CHOOSING)
+        except Exception as e:
+            # Rollback
+            if os.path.exists(backup_path):
+                shutil.move(backup_path, DB_PATH)
+            raise e
+
+    except Exception as e:
+        logger.error(f"Error importing database: {e}")
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        await send_and_track_message(update, context, text="❌ Failed to import database. Rollback performed if possible.")
 
 async def send_analytics_page(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
     """Fetches and displays a specific page of analytics."""
