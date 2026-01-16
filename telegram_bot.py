@@ -36,7 +36,10 @@ logger = logging.getLogger(__name__)
 USER_STATES = {}  # {user_id: state_name}
 SEARCH_CONTEXT = {}  # {user_id: {"term": str, "page": int}}
 USER_PAGINATION_CONTEXT = {}  # {user_id: {"page": int}}
+ANALYTICS_CONTEXT = {}  # {user_id: {"type": str, "page": int}}
+LAST_BOT_MESSAGES = {}  # {user_id: message_id}
 PAGE_SIZE = 5
+ANALYTICS_PAGE_SIZE = 10
 
 # State constants
 CHOOSING = "CHOOSING"
@@ -57,6 +60,62 @@ def set_user_state(user_id: int, state: str):
 def clear_user_state(user_id: int):
     """Clear state for user."""
     USER_STATES.pop(user_id, None)
+
+# --- MESSAGE CLEANUP HELPERS ---
+
+async def safe_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
+    """Safely delete a message, ignoring errors."""
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int = 60):
+    """Schedules a message for deletion after a delay."""
+    await asyncio.sleep(delay)
+    await safe_delete_message(context, chat_id, message_id)
+
+async def send_and_track_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None, photo: bytes = None, reply_markup=None, parse_mode='Markdown', auto_delete: bool = True):
+    """Sends a message, tracks it for immediate cleanup on next nav, and schedules auto-deletion."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    # 1. Immediate cleanup of previous bot message for this user
+    if user_id in LAST_BOT_MESSAGES:
+        await safe_delete_message(context, chat_id, LAST_BOT_MESSAGES[user_id])
+        LAST_BOT_MESSAGES.pop(user_id)
+
+    # 2. Send new message
+    sent_msg = None
+    try:
+        if photo:
+            sent_msg = await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=photo,
+                caption=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode
+            )
+        elif text:
+            sent_msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode
+            )
+    except Exception as e:
+        logger.error(f"Error sending tracked message: {e}")
+        return None
+
+    if sent_msg:
+        # 3. Track this message
+        LAST_BOT_MESSAGES[user_id] = sent_msg.message_id
+        
+        # 4. Schedule auto-deletion
+        if auto_delete:
+            asyncio.create_task(schedule_message_deletion(context, chat_id, sent_msg.message_id))
+            
+    return sent_msg
 
 # --- SECURITY HANDLER ---
 def is_admin(user_id: int) -> bool:
@@ -84,20 +143,16 @@ async def request_admin_approval(update: Update, context: ContextTypes.DEFAULT_T
     
     # Check if already approved
     if is_authorized(user_id):
-        await update.message.reply_text(
-            "✅ You already have full access to all features.",
-            parse_mode='Markdown'
-        )
+        await send_and_track_message(update, context, text="✅ You already have full access to all features.")
         set_user_state(user_id, CHOOSING)
         return
     
     # Notify User
-    await update.message.reply_text(
+    await send_and_track_message(update, context, text=(
         "🔐 *Access Request*\n\n"
         "Sending your request to the admin...\n"
-        "You will be notified once it's reviewed.",
-        parse_mode='Markdown'
-    )
+        "You will be notified once it's reviewed."
+    ))
     
     # Build admin notification message
     first_name = user.first_name or "Unknown"
@@ -143,19 +198,15 @@ async def request_admin_approval(update: Update, context: ContextTypes.DEFAULT_T
             logger.info(f"Access request sent to admin for user {user_id} (no photo)")
     except Exception as e:
         logger.error(f"Failed to send admin request for user {user_id}: {e}")
-        await update.message.reply_text(
-            "⚠️ Failed to send request. Please try again later.",
-            parse_mode='Markdown'
-        )
+        await send_and_track_message(update, context, text="⚠️ Failed to send request. Please try again later.")
         set_user_state(user_id, CHOOSING)
         return
 
-    await update.message.reply_text(
+    await send_and_track_message(update, context, text=(
         "✅ *Request Sent Successfully*\n\n"
         "The admin will review your request.\n"
-        "You will be notified once a decision is made.",
-        parse_mode='Markdown'
-    )
+        "You will be notified once a decision is made."
+    ))
     set_user_state(user_id, CHOOSING)
 
 # --- BOT HANDLERS ---
@@ -171,7 +222,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Main menu sent to user {user.id}")
     except Exception as e:
         logger.error(f"Error in start handler: {e}", exc_info=True)
-        await update.message.reply_text("Sorry, an error occurred. Please try again.")
+        await send_and_track_message(update, context, text="Sorry, an error occurred. Please try again.")
         clear_user_state(user.id)
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -204,10 +255,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
     
-    if update.message:
-        await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
-    elif update.callback_query:
-        await update.callback_query.message.reply_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
+    await send_and_track_message(update, context, text=msg, reply_markup=reply_markup)
 
 async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Routes the user choice from the main menu."""
@@ -216,11 +264,11 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # PUBLIC FEATURES (no authorization required)
     if text == "🔍 Find a Book":
-        await update.message.reply_text("🔎 Please enter the *Book Code* or *Name* to search:", parse_mode='Markdown', reply_markup=ReplyKeyboardRemove())
+        await send_and_track_message(update, context, text="🔎 Please enter the *Book Code* or *Name* to search:", reply_markup=ReplyKeyboardRemove())
         set_user_state(user_id, SEARCHING_BOOK)
         
     elif text == "📖 Check Status":
-        await update.message.reply_text("📖 Please enter the *Book Code* to check status:", parse_mode='Markdown', reply_markup=ReplyKeyboardRemove())
+        await send_and_track_message(update, context, text="📖 Please enter the *Book Code* to check status:", reply_markup=ReplyKeyboardRemove())
         set_user_state(user_id, CHECKING_STATUS)
         
     elif text == "📊 Library Stats":
@@ -229,14 +277,14 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif text == "🔐 Request Access":
         if is_authorized(user_id):
-            await update.message.reply_text("✅ You already have access to all features.", parse_mode='Markdown')
+            await send_and_track_message(update, context, text="✅ You already have access to all features.")
             set_user_state(user_id, CHOOSING)
         else:
             await request_admin_approval(update, context)
     
     elif text == "📊 Advanced Analytics":
         if not is_admin(user_id):
-            await update.message.reply_text("🔒 *Admin Only*\nThis section is restricted to administrators.", parse_mode='Markdown')
+            await send_and_track_message(update, context, text="🔒 *Admin Only*\nThis section is restricted to administrators.")
             set_user_state(user_id, CHOOSING)
             return
         
@@ -246,16 +294,12 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⏰ Overdue List", callback_data="ana_overdue")],
             [InlineKeyboardButton("🔙 Main Menu", callback_data="nav_menu")]
         ]
-        await update.message.reply_text(
-            "📊 *Advanced Analytics*\nSelect a report to view:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
-        )
+        await send_and_track_message(update, context, text="📊 *Advanced Analytics*\nSelect a report to view:", reply_markup=InlineKeyboardMarkup(keyboard))
         set_user_state(user_id, CHOOSING)
 
     elif text == "👥 Bot Users":
         if not is_admin(user_id):
-            await update.message.reply_text("🔒 *Admin Only*\nThis section is restricted to administrators.", parse_mode='Markdown')
+            await send_and_track_message(update, context, text="🔒 *Admin Only*\nThis section is restricted to administrators.")
             set_user_state(user_id, CHOOSING)
             return
         
@@ -268,32 +312,30 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # RESTRICTED FEATURES (authorization required)
     elif text == "👤 Student Profile":
         if not is_authorized(user_id):
-            await update.message.reply_text(
+            await send_and_track_message(update, context, text=(
                 "🔒 *Access Restricted*\n\n"
                 "This feature requires admin approval.\n\n"
-                "Please use 🔐 *Request Access* button to get approved.",
-                parse_mode='Markdown'
-            )
+                "Please use 🔐 *Request Access* button to get approved."
+            ))
             set_user_state(user_id, CHOOSING)
             return
-        await update.message.reply_text("👤 Please enter the *Student ID* or *Name*:", parse_mode='Markdown', reply_markup=ReplyKeyboardRemove())
+        await send_and_track_message(update, context, text="👤 Please enter the *Student ID* or *Name*:", reply_markup=ReplyKeyboardRemove())
         set_user_state(user_id, STUDENT_DETAILS)
         
     elif text == "🕘 Reading History":
         if not is_authorized(user_id):
-            await update.message.reply_text(
+            await send_and_track_message(update, context, text=(
                 "🔒 *Access Restricted*\n\n"
                 "This feature requires admin approval.\n\n"
-                "Please use 🔐 *Request Access* button to get approved.",
-                parse_mode='Markdown'
-            )
+                "Please use 🔐 *Request Access* button to get approved."
+            ))
             set_user_state(user_id, CHOOSING)
             return
-        await update.message.reply_text("🕘 Please enter the *Book Code* to view history:", parse_mode='Markdown', reply_markup=ReplyKeyboardRemove())
+        await send_and_track_message(update, context, text="🕘 Please enter the *Book Code* to view history:", reply_markup=ReplyKeyboardRemove())
         set_user_state(user_id, ISSUE_HISTORY)
     
     else:
-        await update.message.reply_text("⚠️ Unknown option. Please use the menu buttons.")
+        await send_and_track_message(update, context, text="⚠️ Unknown option. Please use the menu buttons.")
         set_user_state(user_id, CHOOSING)
 
 async def handle_search_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -329,7 +371,7 @@ async def send_search_page(update: Update, context: ContextTypes.DEFAULT_TYPE, u
             if update.callback_query:
                 await update.callback_query.edit_message_text(msg)
             else:
-                await update.message.reply_text(msg)
+                await send_and_track_message(update, context, text=msg)
             return
         
         books = data["data"]["books"]
@@ -341,7 +383,7 @@ async def send_search_page(update: Update, context: ContextTypes.DEFAULT_TYPE, u
             if update.callback_query:
                 await update.callback_query.edit_message_text(msg)
             else:
-                await update.message.reply_text(msg)
+                await send_and_track_message(update, context, text=msg)
             return
 
         # Format results into a single professional message
@@ -379,11 +421,7 @@ async def send_search_page(update: Update, context: ContextTypes.DEFAULT_TYPE, u
                 parse_mode='Markdown'
             )
         else:
-            await update.message.reply_text(
-                message_text, 
-                reply_markup=reply_markup, 
-                parse_mode='Markdown'
-            )
+            await send_and_track_message(update, context, text=message_text, reply_markup=reply_markup)
             
     except Exception as e:
         logger.error(f"Error in send_search_page: {e}")
@@ -391,7 +429,7 @@ async def send_search_page(update: Update, context: ContextTypes.DEFAULT_TYPE, u
         if update.callback_query:
             await update.callback_query.edit_message_text(error_msg)
         else:
-            await update.message.reply_text(error_msg)
+            await send_and_track_message(update, context, text=error_msg)
     
     set_user_state(user_id, CHOOSING)
 
@@ -408,7 +446,7 @@ async def handle_book_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
             data = response.json()
         
         if data["status"] != "ok":
-            await update.message.reply_text(f"Book code not found.")
+            await send_and_track_message(update, context, text="Book code not found.")
             return
         
         book = data["data"]
@@ -431,17 +469,15 @@ async def handle_book_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"⚠️ _Please ensure timely return._"
             )
         
-        await update.message.reply_text(msg, parse_mode='Markdown')
+        # Inline Navigation
+        keyboard = [
+            [InlineKeyboardButton("📖 Check Another", callback_data="nav_status"),
+             InlineKeyboardButton("🔙 Main Menu", callback_data="nav_menu")]
+        ]
+        await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
         logger.error(f"Error fetching book status: {e}")
-        await update.message.reply_text("Failed to fetch book status. Please try again.")
-    
-    # Inline Navigation
-    keyboard = [
-        [InlineKeyboardButton("📖 Check Another", callback_data="nav_status"),
-         InlineKeyboardButton("🔙 Main Menu", callback_data="nav_menu")]
-    ]
-    await update.message.reply_text("Choose an action:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await send_and_track_message(update, context, text="Failed to fetch book status. Please try again.")
     set_user_state(user_id, CHOOSING)
 
 async def handle_student_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -457,7 +493,7 @@ async def handle_student_details(update: Update, context: ContextTypes.DEFAULT_T
             data = response.json()
         
         if data["status"] != "ok":
-            await update.message.reply_text("Student not found.")
+            await send_and_track_message(update, context, text="Student not found.")
             await show_main_menu(update, context)
             set_user_state(user_id, CHOOSING)
             return
@@ -465,23 +501,23 @@ async def handle_student_details(update: Update, context: ContextTypes.DEFAULT_T
         student = data["data"]
         
         # 1. Photo Handling
+        photo_bytes = None
         if student["has_photo"] and student["photo"]:
             try:
                 photo_bytes = base64.b64decode(student["photo"])
-                await update.message.reply_photo(photo=photo_bytes)
             except Exception as e:
-                logger.error(f"Error sending student photo: {e}")
+                logger.error(f"Error decoding student photo: {e}")
 
         # 2. Construct Message
         issued_books = student["issued"]
         returned_books = student["returned"]
         
+        msg = ""
         if not issued_books and not returned_books:
-            await update.message.reply_text(
+            msg = (
                 f"📢 *Library Notice*\n\n👤 *Student Profile*\n\n"
                 f"📛 *Name:* {student['name']}\n🏫 *Batch:* {student['batch']}\n\n"
-                f"No records found for this student.",
-                parse_mode='Markdown'
+                f"No records found for this student."
             )
         else:
             msg = (
@@ -504,19 +540,18 @@ async def handle_student_details(update: Update, context: ContextTypes.DEFAULT_T
                     msg += f"- `{book['id']}` – {book['title']} ({book['issue_date']} → {book['return_date']})\n"
             else:
                 msg += "- None\n"
-                
-            await update.message.reply_text(msg, parse_mode='Markdown')
+        
+        # Inline Navigation - Smart Actions
+        keyboard = [
+            [InlineKeyboardButton("🕘 View History", callback_data="nav_history"),
+             InlineKeyboardButton("📚 Search Another", callback_data="nav_student")],
+            [InlineKeyboardButton("🔙 Main Menu", callback_data="nav_menu")]
+        ]
+        
+        await send_and_track_message(update, context, text=msg, photo=photo_bytes, reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
         logger.error(f"Error fetching student details: {e}")
-        await update.message.reply_text("Failed to fetch student details. Please try again.")
-    
-    # Inline Navigation - Smart Actions
-    keyboard = [
-        [InlineKeyboardButton("🕘 View History", callback_data="nav_history"),
-         InlineKeyboardButton("📚 Search Another", callback_data="nav_student")],
-        [InlineKeyboardButton("🔙 Main Menu", callback_data="nav_menu")]
-    ]
-    await update.message.reply_text("Choose an action:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await send_and_track_message(update, context, text="Failed to fetch student details. Please try again.")
     set_user_state(user_id, CHOOSING)
 
 async def handle_issue_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -532,13 +567,13 @@ async def handle_issue_history(update: Update, context: ContextTypes.DEFAULT_TYP
             data = response.json()
         
         if data["status"] != "ok":
-            await update.message.reply_text("Failed to fetch history.")
+            await send_and_track_message(update, context, text="Failed to fetch history.")
             return
         
         history = data["data"]["history"]
         
         if not history:
-            await update.message.reply_text("No transaction history found for this book code.")
+            await send_and_track_message(update, context, text="No transaction history found for this book code.")
         else:
             msg = (
                 f"📢 *Library Notice*\n\n"
@@ -553,21 +588,16 @@ async def handle_issue_history(update: Update, context: ContextTypes.DEFAULT_TYP
                     f"📅 *Returned:* {ret_text}\n"
                     f"---\n"
                 )
-            await update.message.reply_text(msg, parse_mode='Markdown')
+            
+            keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="nav_menu")]]
+            await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
         logger.error(f"Error fetching issue history: {e}")
-        await update.message.reply_text("Failed to fetch history. Please try again.")
-
-    keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="nav_menu")]]
-    await update.message.reply_text("Choose an action:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await send_and_track_message(update, context, text="Failed to fetch history. Please try again.")
     set_user_state(user_id, CHOOSING)
 
 async def handle_book_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Displays aggregate book counts."""
-    # This handler can be triggered text command or callback
-    # If callback, update.message might be None
-    message_func = update.message.reply_text if update.message else update.callback_query.message.reply_text
-    
     await update.effective_chat.send_action(ChatAction.TYPING)
     
     try:
@@ -576,7 +606,7 @@ async def handle_book_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data = response.json()
         
         if data["status"] != "ok":
-            await message_func("Error fetching book counts.")
+            await send_and_track_message(update, context, text="Error fetching book counts.")
             return
         
         stats = data["data"]
@@ -588,33 +618,18 @@ async def handle_book_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📖 *Currently Issued:* {stats['issued_books']}\n\n"
             f"_Data accurate as of {stats['timestamp']}_"
         )
-        await message_func(msg, parse_mode='Markdown')
+        await send_and_track_message(update, context, text=msg)
     except Exception as e:
         logger.error(f"Error fetching library stats: {e}")
-        await message_func("Failed to fetch library stats. Please try again.")
+        await send_and_track_message(update, context, text="Failed to fetch library stats. Please try again.")
         
-    # If called from menu (update.message present), show menu again? 
-    # Or strict button nav? Let's show menu if it was a text choice.
+    # If called from menu (update.message present), show menu again
     if update.message:
         await show_main_menu(update, context)
-
-async def handle_exit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Exits the conversation."""
-    user_id = update.effective_user.id
-    await update.message.reply_text("Session closed. Use /start to begin again.", reply_markup=ReplyKeyboardRemove())
-    clear_user_state(user_id)
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancels and ends the conversation."""
-    user_id = update.effective_user.id
-    await update.message.reply_text("Operation cancelled.", reply_markup=ReplyKeyboardRemove())
-    await show_main_menu(update, context)
-    set_user_state(user_id, CHOOSING)
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles all inline button clicks."""
     query = update.callback_query
-    await query.answer()
     
     data = query.data
     user_id = update.effective_user.id
@@ -712,62 +727,39 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("🔒 Admin only", show_alert=True)
             return
             
-        await query.message.edit_text("⏳ _Generating report..._", parse_mode='Markdown')
-        
-        try:
-            endpoint = {
-                "ana_most": "analytics_most_issued",
-                "ana_readers": "analytics_top_readers",
-                "ana_overdue": "analytics_overdue"
-            }.get(data)
-            
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                response = await client.post(f"{API_BASE}/{endpoint}")
-                res_data = response.json()
-            
-            if res_data["status"] != "ok":
-                await query.message.edit_text(f"❌ Error: {res_data.get('message', 'Unknown error')}")
-                return
+        if data == "ana_back":
+            ANALYTICS_CONTEXT.pop(user_id, None)
+            keyboard = [
+                [InlineKeyboardButton("🔥 Most Issued Books", callback_data="ana_most")],
+                [InlineKeyboardButton("🧑‍🎓 Top Readers", callback_data="ana_readers")],
+                [InlineKeyboardButton("⏰ Overdue List", callback_data="ana_overdue")],
+                [InlineKeyboardButton("🔙 Main Menu", callback_data="nav_menu")]
+            ]
+            await query.message.edit_text("📊 *Advanced Analytics*\nSelect a report to view:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            return
 
-            items = res_data["data"]
-            if not items:
-                msg = "📊 *Analytics Report*\n\nNo data found for this category."
-            else:
-                if data == "ana_most":
-                    msg = "🔥 *Most Issued Books (Top 10)*\n\n"
-                    for i, item in enumerate(items, 1):
-                        msg += f"{i}) `{item['id']}` — {item['title']} ({item['count']} issues)\n"
-                elif data == "ana_readers":
-                    msg = "🧑‍🎓 *Top Readers (Top 10)*\n\n"
-                    for i, item in enumerate(items, 1):
-                        msg += f"{i}) {item['name']} ({item['count']} books)\n"
-                elif data == "ana_overdue":
-                    msg = "⏰ *Overdue List (Top 10)*\n\n"
-                    for i, item in enumerate(items, 1):
-                        msg += f"{i}) {item['title']} — {item['name']} (Due: {item['due_date']})\n"
-            
-            keyboard = [[InlineKeyboardButton("🔙 Back to Analytics", callback_data="ana_back")],
-                        [InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]
-            await query.message.edit_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-            
-        except Exception as e:
-            logger.error(f"Analytics error: {e}")
-            await query.message.edit_text("❌ Failed to generate report. Please try again.")
-        return
+        if data == "ana_prev":
+            if user_id in ANALYTICS_CONTEXT:
+                ANALYTICS_CONTEXT[user_id]["page"] -= 1
+                await send_analytics_page(update, context, user_id)
+            return
 
-    if data == "ana_back":
-        keyboard = [
-            [InlineKeyboardButton("🔥 Most Issued Books", callback_data="ana_most")],
-            [InlineKeyboardButton("🧑‍🎓 Top Readers", callback_data="ana_readers")],
-            [InlineKeyboardButton("⏰ Overdue List", callback_data="ana_overdue")],
-            [InlineKeyboardButton("🔙 Main Menu", callback_data="nav_menu")]
-        ]
-        await query.message.edit_text("📊 *Advanced Analytics*\nSelect a report to view:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        if data == "ana_next":
+            if user_id in ANALYTICS_CONTEXT:
+                ANALYTICS_CONTEXT[user_id]["page"] += 1
+                await send_analytics_page(update, context, user_id)
+            return
+
+        # Initial analytics call
+        ana_type = data # e.g., ana_most
+        ANALYTICS_CONTEXT[user_id] = {"type": ana_type, "page": 1}
+        await send_analytics_page(update, context, user_id)
         return
 
     # 2. Navigation Actions mechanism (State transitions via button)
     if data == "nav_menu":
         SEARCH_CONTEXT.pop(user_id, None)  # Clear search context
+        ANALYTICS_CONTEXT.pop(user_id, None)  # Clear analytics context
         await show_main_menu(update, context)
         set_user_state(user_id, CHOOSING)
         
@@ -782,28 +774,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_search_page(update, context, user_id, SEARCH_CONTEXT[user_id]["page"])
             
     elif data == "nav_search":
-        await query.message.reply_text("🔎 Please enter *Book Code* or *Name*:", parse_mode='Markdown', reply_markup=ReplyKeyboardRemove())
+        await send_and_track_message(update, context, text="🔎 Please enter *Book Code* or *Name*:", reply_markup=ReplyKeyboardRemove())
         set_user_state(user_id, SEARCHING_BOOK)
         
     elif data == "nav_status":
-        await query.message.reply_text("📖 Enter *Book Code*:", parse_mode='Markdown', reply_markup=ReplyKeyboardRemove())
+        await send_and_track_message(update, context, text="📖 Enter *Book Code*:", reply_markup=ReplyKeyboardRemove())
         set_user_state(user_id, CHECKING_STATUS)
         
     elif data == "nav_student":
         # Check auth again just in case
         if not is_authorized(user_id):
-            await query.message.reply_text("🚫 details restricted.")
+            await send_and_track_message(update, context, text="🚫 details restricted.")
             set_user_state(user_id, CHOOSING)
             return
-        await query.message.reply_text("👤 Enter *Student ID* or *Name*:", parse_mode='Markdown', reply_markup=ReplyKeyboardRemove())
+        await send_and_track_message(update, context, text="👤 Enter *Student ID* or *Name*:", reply_markup=ReplyKeyboardRemove())
         set_user_state(user_id, STUDENT_DETAILS)
         
     elif data == "nav_history":
         if not is_authorized(user_id):
-            await query.message.reply_text("🚫 history restricted.")
+            await send_and_track_message(update, context, text="🚫 history restricted.")
             set_user_state(user_id, CHOOSING)
             return
-        await query.message.reply_text("🕘 Enter *Book Code*:", parse_mode='Markdown', reply_markup=ReplyKeyboardRemove())
+        await send_and_track_message(update, context, text="🕘 Enter *Book Code*:", reply_markup=ReplyKeyboardRemove())
         set_user_state(user_id, ISSUE_HISTORY)
 
     # 4. Bot Users Management
@@ -878,7 +870,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_main_menu(update, context)
     except Exception as e:
         logger.error(f"Error in handle_message for user {user_id}: {e}", exc_info=True)
-        await update.message.reply_text("Sorry, an error occurred. Please try again.")
+        await send_and_track_message(update, context, text="Sorry, an error occurred. Please try again.")
         set_user_state(user_id, CHOOSING)
 
 # --- RUNTIME GUARD ---
@@ -904,7 +896,7 @@ async def send_bot_users_page(update: Update, context: ContextTypes.DEFAULT_TYPE
             res_data = response.json()
             
         if res_data["status"] != "ok":
-            await update.effective_message.reply_text("❌ Error fetching users.")
+            await send_and_track_message(update, context, text="❌ Error fetching users.")
             return
 
         users = res_data["data"]["users"]
@@ -931,11 +923,11 @@ async def send_bot_users_page(update: Update, context: ContextTypes.DEFAULT_TYPE
         if update.callback_query:
             await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         else:
-            await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
             
     except Exception as e:
         logger.error(f"Error in send_bot_users_page: {e}")
-        await update.effective_message.reply_text("❌ Failed to load users.")
+        await send_and_track_message(update, context, text="❌ Failed to load users.")
 
 async def show_user_details(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int):
     """Shows full details and management actions for a user."""
@@ -1014,6 +1006,76 @@ async def update_user_role_api(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         logger.error(f"Error in update_user_role_api: {e}")
         await update.callback_query.answer("❌ API Error")
+
+async def send_analytics_page(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Fetches and displays a specific page of analytics."""
+    context_data = ANALYTICS_CONTEXT.get(user_id)
+    if not context_data:
+        return
+
+    ana_type = context_data["type"]
+    page = context_data["page"]
+    
+    query = update.callback_query
+    await query.message.edit_text("⏳ _Generating report..._", parse_mode='Markdown')
+
+    try:
+        endpoint = {
+            "ana_most": "analytics_most_issued",
+            "ana_readers": "analytics_top_readers",
+            "ana_overdue": "analytics_overdue"
+        }.get(ana_type)
+        
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(f"{API_BASE}/{endpoint}", json={
+                "page": page,
+                "page_size": ANALYTICS_PAGE_SIZE
+            })
+            res_data = response.json()
+        
+        if res_data["status"] != "ok":
+            await query.message.edit_text(f"❌ Error: {res_data.get('message', 'Unknown error')}")
+            return
+
+        result_data = res_data["data"]
+        items = result_data["items"]
+        total_pages = result_data["total_pages"]
+        total_count = result_data["total_count"]
+
+        if not items:
+            msg = "📊 *Analytics Report*\n\nNo data found for this category."
+        else:
+            if ana_type == "ana_most":
+                msg = f"🔥 *Most Issued Books*\nTotal: {total_count} | Page: {page}/{total_pages}\n\n"
+                for i, item in enumerate(items, 1 + (page-1)*ANALYTICS_PAGE_SIZE):
+                    msg += f"{i}) `{item['id']}` — {item['title']} ({item['count']} issues)\n"
+            elif ana_type == "ana_readers":
+                msg = f"🧑‍🎓 *Top Readers*\nTotal: {total_count} | Page: {page}/{total_pages}\n\n"
+                for i, item in enumerate(items, 1 + (page-1)*ANALYTICS_PAGE_SIZE):
+                    msg += f"{i}) {item['name']} ({item['count']} books)\n"
+            elif ana_type == "ana_overdue":
+                msg = f"⏰ *Overdue List*\nTotal: {total_count} | Page: {page}/{total_pages}\n\n"
+                for i, item in enumerate(items, 1 + (page-1)*ANALYTICS_PAGE_SIZE):
+                    msg += f"{i}) {item['title']} — {item['name']} (Due: {item['due_date']})\n"
+
+        keyboard = []
+        nav_row = []
+        if page > 1:
+            nav_row.append(InlineKeyboardButton("⏮ Prev", callback_data="ana_prev"))
+        if page < total_pages:
+            nav_row.append(InlineKeyboardButton("⏭ Next", callback_data="ana_next"))
+        
+        if nav_row:
+            keyboard.append(nav_row)
+            
+        keyboard.append([InlineKeyboardButton("🔙 Back to Analytics", callback_data="ana_back")])
+        keyboard.append([InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")])
+        
+        await query.message.edit_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        
+    except Exception as e:
+        logger.error(f"Analytics error: {e}")
+        await query.message.edit_text("❌ Failed to generate report. Please try again.")
 
 if __name__ == '__main__':
     if not BOT_RUNNING:

@@ -282,49 +282,89 @@ def library_stats():
 
 @app.route('/analytics_most_issued', methods=['POST'])
 def analytics_most_issued():
-    """Get top 10 most issued books."""
+    """Get most issued books with pagination."""
     try:
+        data = request.get_json() or {}
+        page = data.get('page', 1)
+        page_size = data.get('page_size', 10)
+        offset = (page - 1) * page_size
+
+        # Get total count
+        count_query = "SELECT COUNT(DISTINCT book_id) FROM transactions"
+        total_count = query_db(count_query)[0][0]
+
         query = """
             SELECT b.id, b.title, COUNT(t.book_id) as issue_count 
             FROM transactions t 
             JOIN books b ON t.book_id = b.id 
             GROUP BY t.book_id 
-            ORDER BY issue_count DESC LIMIT 10
+            ORDER BY issue_count DESC 
+            LIMIT ? OFFSET ?
         """
-        results = query_db(query)
-        data = [{"id": r[0], "title": r[1], "count": r[2]} for r in results]
-        return jsonify({"status": "ok", "data": data})
+        results = query_db(query, (page_size, offset))
+        books = [{"id": r[0], "title": r[1], "count": r[2]} for r in results]
+        
+        total_pages = (total_count + page_size - 1) // page_size if total_count > 0 else 1
+        
+        return jsonify({
+            "status": "ok", 
+            "data": {
+                "items": books,
+                "total_count": total_count,
+                "total_pages": total_pages,
+                "current_page": page
+            }
+        })
     except Exception as e:
         logger.error(f"Error in analytics_most_issued: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/analytics_top_readers', methods=['POST'])
 def analytics_top_readers():
-    """Get top 10 members by issue count."""
+    """Get top members by issue count with pagination."""
     try:
+        data = request.get_json() or {}
+        page = data.get('page', 1)
+        page_size = data.get('page_size', 10)
+        offset = (page - 1) * page_size
+
+        # Get total count
+        count_query = "SELECT COUNT(DISTINCT member_id) FROM transactions"
+        total_count = query_db(count_query)[0][0]
+
         query = """
             SELECT m.name, COUNT(t.member_id) as issue_count 
             FROM transactions t 
             JOIN members m ON t.member_id = m.student_id 
             GROUP BY t.member_id 
-            ORDER BY issue_count DESC LIMIT 10
+            ORDER BY issue_count DESC 
+            LIMIT ? OFFSET ?
         """
-        results = query_db(query)
-        data = [{"name": r[0], "count": r[1]} for r in results]
-        return jsonify({"status": "ok", "data": data})
+        results = query_db(query, (page_size, offset))
+        readers = [{"name": r[0], "count": r[1]} for r in results]
+        
+        total_pages = (total_count + page_size - 1) // page_size if total_count > 0 else 1
+
+        return jsonify({
+            "status": "ok", 
+            "data": {
+                "items": readers,
+                "total_count": total_count,
+                "total_pages": total_pages,
+                "current_page": page
+            }
+        })
     except Exception as e:
         logger.error(f"Error in analytics_top_readers: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/analytics_overdue', methods=['POST'])
 def analytics_overdue():
-    """Get list of overdue transactions."""
+    """Get list of overdue transactions with pagination."""
     try:
-        # Assuming date format is DD-MM-YYYY or YYYY-MM-DD. 
-        # For SQLite comparison to work reliably on text, we'd ideally want YYYY-MM-DD.
-        # However, we'll fetch all active issues and filter in Python for safety 
-        # if the DB format is non-standard, or use a simple date string comparison.
-        today = datetime.now().strftime("%Y-%m-%d")
+        data = request.get_json() or {}
+        page = data.get('page', 1)
+        page_size = data.get('page_size', 10)
         
         query = """
             SELECT b.title, m.name, t.due_date 
@@ -336,24 +376,38 @@ def analytics_overdue():
         """
         results = query_db(query)
         
-        # Filter overdue in Python to be safe with various date formats
-        overdue = []
+        overdue_all = []
         now = datetime.now()
         for title, name, due_str in results:
             try:
-                # Try common formats
                 for fmt in ("%d-%m-%Y", "%Y-%m-%d"):
                     try:
                         due_date = datetime.strptime(due_str, fmt)
                         if due_date < now:
-                            overdue.append({"title": title, "name": name, "due_date": due_str})
+                            overdue_all.append({"title": title, "name": name, "due_date": due_str})
                         break
                     except ValueError:
                         continue
             except Exception:
                 continue
+        
+        total_count = len(overdue_all)
+        total_pages = (total_count + page_size - 1) // page_size if total_count > 0 else 1
+        
+        # Paginate the list
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        paginated_items = overdue_all[start_idx:end_idx]
                 
-        return jsonify({"status": "ok", "data": overdue[:10]})
+        return jsonify({
+            "status": "ok", 
+            "data": {
+                "items": paginated_items,
+                "total_count": total_count,
+                "total_pages": total_pages,
+                "current_page": page
+            }
+        })
     except Exception as e:
         logger.error(f"Error in analytics_overdue: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
