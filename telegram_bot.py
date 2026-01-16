@@ -65,12 +65,13 @@ SEARCH_CONTEXT = {}  # {user_id: {"term": str, "page": int}}
 USER_PAGINATION_CONTEXT = {}  # {user_id: {"page": int}}
 ANALYTICS_CONTEXT = {}  # {user_id: {"type": str, "page": int}}
 # --- CLEANUP CONFIGURATION ---
-DELETE_VISIBLE_SECONDS = 5
+QUICK_DELETE_SECONDS = 5
+LONG_DELETE_SECONDS = 300
 VANISH_ANIMATION_SECONDS = 2
-MENU_TAP_DELETE_DELAY = DELETE_VISIBLE_SECONDS
+MENU_TAP_DELETE_DELAY = QUICK_DELETE_SECONDS
 PROMPT_TTL_SECONDS = 45
-INPUT_DELETE_DELAY = DELETE_VISIBLE_SECONDS
-RESULT_TTL_SECONDS = 300
+INPUT_DELETE_DELAY = QUICK_DELETE_SECONDS
+RESULT_TTL_SECONDS = LONG_DELETE_SECONDS
 
 CLEANUP_CONTEXT = {}  # {user_id: {"menu_tap_id": int, "prompt_id": int, "last_result_id": int}}
 DELETION_TASKS = {}  # {(chat_id, message_id): asyncio.Task}
@@ -123,63 +124,69 @@ async def run_clean_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in CLEANUP_CONTEXT:
         data = CLEANUP_CONTEXT[user_id]
         if data["menu_tap_id"]:
-            task = asyncio.create_task(schedule_message_deletion(context, chat_id, data["menu_tap_id"], MENU_TAP_DELETE_DELAY, show_vanish=True))
-            DELETION_TASKS[(chat_id, data["menu_tap_id"])] = task
+            await schedule_delete(context, chat_id, data["menu_tap_id"], QUICK_DELETE_SECONDS, show_vanish=True)
             data["menu_tap_id"] = None
         if data["prompt_id"]:
-            # Prompts stay for 45s unless explicitly cleared, but here we might want to clear them after input
-            task = asyncio.create_task(schedule_message_deletion(context, chat_id, data["prompt_id"], INPUT_DELETE_DELAY, show_vanish=True))
-            DELETION_TASKS[(chat_id, data["prompt_id"])] = task
+            await schedule_delete(context, chat_id, data["prompt_id"], QUICK_DELETE_SECONDS, show_vanish=True)
             data["prompt_id"] = None
             
     # Also delete the current user input message after a short delay
     if update.message:
-        task = asyncio.create_task(schedule_message_deletion(context, chat_id, update.message.message_id, INPUT_DELETE_DELAY, show_vanish=True))
-        DELETION_TASKS[(chat_id, update.message.message_id)] = task
+        await schedule_delete(context, chat_id, update.message.message_id, QUICK_DELETE_SECONDS, show_vanish=True)
 
 # --- MESSAGE CLEANUP HELPERS ---
 
-async def safe_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
-    """Safely delete a message, ignoring errors and cancelling scheduled tasks."""
-    # Cancel any existing auto-delete task for this message
-    task = DELETION_TASKS.pop((chat_id, message_id), None)
-    if task:
-        task.cancel()
-        
-    try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception:
-        pass
+# --- MESSAGE CLEANUP HELPERS ---
 
-async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int = RESULT_TTL_SECONDS, show_vanish: bool = False):
-    """Schedules a message for deletion after a delay, optionally with a vanish animation."""
+async def _perform_scheduled_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int, show_vanish: bool):
+    """Internal coroutine to handle delay, animation, and deletion."""
     try:
-        await asyncio.sleep(delay)
+        # 1. Wait for the visible period (minus animation time)
+        wait_time = max(0, delay - VANISH_ANIMATION_SECONDS)
+        await asyncio.sleep(wait_time)
         
+        # 2. Show vanish animation if enabled
         if show_vanish:
-            # Powder vanishing animation (only works for bot messages)
             frames = ["🫧 Vanishing in 2…", "✨ Vanishing in 1…", "💨 …"]
             frame_delay = VANISH_ANIMATION_SECONDS / len(frames)
             for frame in frames:
                 try:
-                    # Try to edit. This will fail for user messages, which is fine.
                     await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=frame)
                 except Exception:
-                    # If edit fails, we just wait the time anyway to maintain the delay
-                    pass
+                    pass # Ignore edit failures
                 await asyncio.sleep(frame_delay)
         
+        # 3. Final deletion
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
     except asyncio.CancelledError:
         pass
     except Exception:
         pass
     finally:
-        # Only pop if it's still our task
+        # Cleanup task tracking only if this is still the active task
         if DELETION_TASKS.get((chat_id, message_id)) == asyncio.current_task():
             DELETION_TASKS.pop((chat_id, message_id), None)
 
-async def send_and_track_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None, photo: bytes = None, reply_markup=None, parse_mode='Markdown', auto_delete: bool = True, delay: int = RESULT_TTL_SECONDS, is_result: bool = False, cleanup_previous: bool = True):
+async def schedule_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int = QUICK_DELETE_SECONDS, show_vanish: bool = True):
+    """Unified scheduler for message deletion. Cancels existing tasks for the same message."""
+    # Cancel any existing auto-delete task for this message
+    old_task = DELETION_TASKS.pop((chat_id, message_id), None)
+    if old_task:
+        old_task.cancel()
+        
+    task = asyncio.create_task(_perform_scheduled_delete(context, chat_id, message_id, delay, show_vanish))
+    DELETION_TASKS[(chat_id, message_id)] = task
+    return task
+
+async def safe_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int = QUICK_DELETE_SECONDS):
+    """Safely schedules a message for deletion after a quick delay (default 5s)."""
+    return await schedule_delete(context, chat_id, message_id, delay=delay, show_vanish=True)
+
+async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int = LONG_DELETE_SECONDS, show_vanish: bool = True):
+    """Schedules a message for deletion after a long delay (default 300s)."""
+    return await schedule_delete(context, chat_id, message_id, delay, show_vanish)
+
+async def send_and_track_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None, photo: bytes = None, reply_markup=None, parse_mode='Markdown', auto_delete: bool = True, delay: int = LONG_DELETE_SECONDS, is_result: bool = False, cleanup_previous: bool = True):
     """Sends a message, tracks it, and schedules auto-deletion."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
@@ -236,10 +243,8 @@ async def send_and_track_message(update: Update, context: ContextTypes.DEFAULT_T
         
         # 4. Schedule auto-deletion task
         if auto_delete:
-            # Vanish only for non-results (prompts/menus)
-            vanish = not is_result
-            task = asyncio.create_task(schedule_message_deletion(context, chat_id, sent_msg.message_id, delay, show_vanish=vanish))
-            DELETION_TASKS[(chat_id, sent_msg.message_id)] = task
+            # Enable vanish for all tracked messages as per requirement
+            await schedule_delete(context, chat_id, sent_msg.message_id, delay, show_vanish=True)
             
     return sent_msg
 
@@ -482,7 +487,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⏰ Overdue List", callback_data="ana_overdue")],
             [InlineKeyboardButton("🔙 Main Menu", callback_data="nav_menu")]
         ]
-        await send_and_track_message(update, context, text="📊 *Advanced Analytics*\nSelect a report to view:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await send_and_track_message(update, context, text="📊 *Advanced Analytics*\nSelect a report to view:", reply_markup=InlineKeyboardMarkup(keyboard), is_result=True)
         set_user_state(user_id, CHOOSING)
 
     elif text == "👥 Bot Users":
@@ -1164,8 +1169,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif current_state == CHOOSING:
         # Store the menu button tap ID and schedule its deletion
         store_menu_tap(user_id, update.message.message_id)
-        task = asyncio.create_task(schedule_message_deletion(context, update.effective_chat.id, update.message.message_id, MENU_TAP_DELETE_DELAY, show_vanish=True))
-        DELETION_TASKS[(update.effective_chat.id, update.message.message_id)] = task
+        await schedule_delete(context, update.effective_chat.id, update.message.message_id, QUICK_DELETE_SECONDS, show_vanish=True)
 
     try:
         if current_state == CHOOSING:
