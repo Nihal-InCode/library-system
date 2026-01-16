@@ -669,10 +669,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Sorry, an error occurred. Please try again.")
         set_user_state(user_id, CHOOSING)
 
-# --- MAIN ---
+# --- RUNTIME GUARD ---
+BOT_RUNNING = False
 
 def init_bot():
-    """Main function to run the bot."""
+    """Main function to initialize the bot application."""
     application = ApplicationBuilder().token(TOKEN).build()
 
     # Add simple handlers instead of ConversationHandler
@@ -681,9 +682,17 @@ def init_bot():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_callback))
     
-    logger.info("Bot started and waiting for messages...")
-    # drop_pending_updates=True prevents 409 Conflict errors during redeploys/restarts
-    application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    return application
 
 if __name__ == '__main__':
-    init_bot()
+    if not BOT_RUNNING:
+        BOT_RUNNING = True
+        logger.info("Initializing bot system...")
+        app_instance = init_bot()
+        
+        logger.info("Bot started and waiting for messages...")
+        # drop_pending_updates=True prevents 409 Conflict errors during redeploys/restarts
+        # allowed_updates=Update.ALL_TYPES ensures all update types are handled correctly
+        app_instance.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    else:
+        logger.warning("Bot is already running. Skipping duplicate startup.")
