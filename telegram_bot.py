@@ -682,7 +682,8 @@ def init_bot():
     application.add_handler(CallbackQueryHandler(handle_callback))
     
     logger.info("Bot started and waiting for messages...")
-    application.run_polling()
+    # drop_pending_updates=True prevents 409 Conflict errors during redeploys/restarts
+    application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     init_bot()
