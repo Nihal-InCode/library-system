@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 
 # --- MANUAL STATE MANAGEMENT ---
 USER_STATES = {}  # {user_id: state_name}
+SEARCH_CONTEXT = {}  # {user_id: {"term": str, "page": int}}
+USER_PAGINATION_CONTEXT = {}  # {user_id: {"page": int}}
+PAGE_SIZE = 5
 
 # State constants
 CHOOSING = "CHOOSING"
@@ -61,6 +64,18 @@ def is_admin(user_id: int) -> bool:
 
 def is_authorized(user_id: int) -> bool:
     return is_admin(user_id) or user_id in APPROVED_USERS
+
+async def upsert_bot_user(user):
+    """Update user's last active status and info in the DB."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(f"{API_BASE}/upsert_user", json={
+                "chat_id": user.id,
+                "name": user.full_name,
+                "username": user.username
+            })
+    except Exception as e:
+        logger.error(f"Failed to upsert bot user {user.id}: {e}")
 
 async def request_admin_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sends approval request to admin."""
@@ -169,8 +184,8 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             ["🔍 Find a Book", "📖 Check Status"],
             ["👤 Student Profile", "🕘 Reading History"],
-            ["📊 Library Stats"],
-            ["❌ Exit"]
+            ["📊 Library Stats", "📊 Advanced Analytics"],
+            ["👥 Bot Users", "❌ Exit"]
         ]
         msg = "👋 *Welcome to the Library Bot*\n_Please select an action below:_"
     else:
@@ -219,6 +234,34 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await request_admin_approval(update, context)
     
+    elif text == "📊 Advanced Analytics":
+        if not is_admin(user_id):
+            await update.message.reply_text("🔒 *Admin Only*\nThis section is restricted to administrators.", parse_mode='Markdown')
+            set_user_state(user_id, CHOOSING)
+            return
+        
+        keyboard = [
+            [InlineKeyboardButton("🔥 Most Issued Books", callback_data="ana_most")],
+            [InlineKeyboardButton("🧑‍🎓 Top Readers", callback_data="ana_readers")],
+            [InlineKeyboardButton("⏰ Overdue List", callback_data="ana_overdue")],
+            [InlineKeyboardButton("🔙 Main Menu", callback_data="nav_menu")]
+        ]
+        await update.message.reply_text(
+            "📊 *Advanced Analytics*\nSelect a report to view:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+        set_user_state(user_id, CHOOSING)
+
+    elif text == "👥 Bot Users":
+        if not is_admin(user_id):
+            await update.message.reply_text("🔒 *Admin Only*\nThis section is restricted to administrators.", parse_mode='Markdown')
+            set_user_state(user_id, CHOOSING)
+            return
+        
+        USER_PAGINATION_CONTEXT[user_id] = {"page": 1}
+        await send_bot_users_page(update, context, user_id, 1)
+    
     elif text == "❌ Exit":
         await handle_exit(update, context)
     
@@ -254,48 +297,102 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_user_state(user_id, CHOOSING)
 
 async def handle_search_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes search book request."""
+    """Processes search book request and initializes pagination."""
     user_id = update.effective_user.id
     term = update.message.text.strip()
     
+    # Initialize search context
+    SEARCH_CONTEXT[user_id] = {"term": term, "page": 1}
+    
     await update.effective_chat.send_action(ChatAction.TYPING)
+    await send_search_page(update, context, user_id, 1)
+
+async def send_search_page(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, page: int):
+    """Fetches and displays a specific page of search results."""
+    context_data = SEARCH_CONTEXT.get(user_id)
+    if not context_data:
+        return
+
+    term = context_data["term"]
     
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(f"{API_BASE}/search_book", json={"term": term})
+            response = await client.post(f"{API_BASE}/search_book", json={
+                "term": term,
+                "page": page,
+                "page_size": PAGE_SIZE
+            })
             data = response.json()
         
         if data["status"] != "ok":
-            await update.message.reply_text(f"Error: {data.get('message', 'Unknown error')}")
+            msg = f"Error: {data.get('message', 'Unknown error')}"
+            if update.callback_query:
+                await update.callback_query.edit_message_text(msg)
+            else:
+                await update.message.reply_text(msg)
             return
         
         books = data["data"]["books"]
+        total_pages = data["data"]["total_pages"]
+        total_count = data["data"]["total_count"]
         
         if not books:
-            await update.message.reply_text("No books found matching that term.")
+            msg = "No books found matching that term."
+            if update.callback_query:
+                await update.callback_query.edit_message_text(msg)
+            else:
+                await update.message.reply_text(msg)
+            return
+
+        # Format results into a single professional message
+        message_text = f"📢 *Library Notice*\n\n📘 *Search Results for:* `{term}`\n"
+        message_text += f"🔢 *Total Found:* {total_count}\n"
+        message_text += f"📄 *Page:* {page}/{total_pages}\n\n"
+        
+        for book in books:
+            status_icon = "✅" if book["available"] > 0 else "❌"
+            message_text += (
+                f"📚 *Code:* `{book['id']}`\n"
+                f"📘 *Title:* {book['title']}\n"
+                f"📊 *Status:* {status_icon} {'Available' if book['available'] > 0 else 'Issued'}\n"
+                f"-------------------\n"
+            )
+
+        # Build pagination keyboard
+        keyboard = []
+        nav_row = []
+        if page > 1:
+            nav_row.append(InlineKeyboardButton("⏮ Prev", callback_data=f"page_prev"))
+        if page < total_pages:
+            nav_row.append(InlineKeyboardButton("⏭ Next", callback_data=f"page_next"))
+        
+        if nav_row:
+            keyboard.append(nav_row)
+            
+        keyboard.append([InlineKeyboardButton("🔙 Main Menu", callback_data="nav_menu")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                message_text, 
+                reply_markup=reply_markup, 
+                parse_mode='Markdown'
+            )
         else:
-            for book in books:
-                status = "✅ Available" if book["available"] > 0 else "❌ Issued"
-                msg = (
-                    f"📢 *Library Notice*\n\n"
-                    f"📘 *Book Search Result*\n\n"
-                    f"📚 *Book Code:* `{book['id']}`\n"
-                    f"📘 *Title:* {book['title']}\n"
-                    f"✍️ *Author:* {book['author']}\n"
-                    f"🏷️ *Category:* {book['category']}\n"
-                    f"📊 *Status:* {status}"
-                )
-                await update.message.reply_text(msg, parse_mode='Markdown')
+            await update.message.reply_text(
+                message_text, 
+                reply_markup=reply_markup, 
+                parse_mode='Markdown'
+            )
+            
     except Exception as e:
-        logger.error(f"Error fetching search results: {e}")
-        await update.message.reply_text("Failed to search books. Please try again.")
+        logger.error(f"Error in send_search_page: {e}")
+        error_msg = "Failed to fetch results. Please try again."
+        if update.callback_query:
+            await update.callback_query.edit_message_text(error_msg)
+        else:
+            await update.message.reply_text(error_msg)
     
-    # Inline Navigation
-    keyboard = [
-        [InlineKeyboardButton("🔍 Search Again", callback_data="nav_search"),
-         InlineKeyboardButton("🔙 Main Menu", callback_data="nav_menu")]
-    ]
-    await update.message.reply_text("Choose an action:", reply_markup=InlineKeyboardMarkup(keyboard))
     set_user_state(user_id, CHOOSING)
 
 async def handle_book_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -609,11 +706,81 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         return
 
+    # 3. Analytics Actions
+    if data.startswith("ana_"):
+        if not is_admin(user_id):
+            await query.answer("🔒 Admin only", show_alert=True)
+            return
+            
+        await query.message.edit_text("⏳ _Generating report..._", parse_mode='Markdown')
+        
+        try:
+            endpoint = {
+                "ana_most": "analytics_most_issued",
+                "ana_readers": "analytics_top_readers",
+                "ana_overdue": "analytics_overdue"
+            }.get(data)
+            
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.post(f"{API_BASE}/{endpoint}")
+                res_data = response.json()
+            
+            if res_data["status"] != "ok":
+                await query.message.edit_text(f"❌ Error: {res_data.get('message', 'Unknown error')}")
+                return
+
+            items = res_data["data"]
+            if not items:
+                msg = "📊 *Analytics Report*\n\nNo data found for this category."
+            else:
+                if data == "ana_most":
+                    msg = "🔥 *Most Issued Books (Top 10)*\n\n"
+                    for i, item in enumerate(items, 1):
+                        msg += f"{i}) `{item['id']}` — {item['title']} ({item['count']} issues)\n"
+                elif data == "ana_readers":
+                    msg = "🧑‍🎓 *Top Readers (Top 10)*\n\n"
+                    for i, item in enumerate(items, 1):
+                        msg += f"{i}) {item['name']} ({item['count']} books)\n"
+                elif data == "ana_overdue":
+                    msg = "⏰ *Overdue List (Top 10)*\n\n"
+                    for i, item in enumerate(items, 1):
+                        msg += f"{i}) {item['title']} — {item['name']} (Due: {item['due_date']})\n"
+            
+            keyboard = [[InlineKeyboardButton("🔙 Back to Analytics", callback_data="ana_back")],
+                        [InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]
+            await query.message.edit_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Analytics error: {e}")
+            await query.message.edit_text("❌ Failed to generate report. Please try again.")
+        return
+
+    if data == "ana_back":
+        keyboard = [
+            [InlineKeyboardButton("🔥 Most Issued Books", callback_data="ana_most")],
+            [InlineKeyboardButton("🧑‍🎓 Top Readers", callback_data="ana_readers")],
+            [InlineKeyboardButton("⏰ Overdue List", callback_data="ana_overdue")],
+            [InlineKeyboardButton("🔙 Main Menu", callback_data="nav_menu")]
+        ]
+        await query.message.edit_text("📊 *Advanced Analytics*\nSelect a report to view:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        return
+
     # 2. Navigation Actions mechanism (State transitions via button)
     if data == "nav_menu":
+        SEARCH_CONTEXT.pop(user_id, None)  # Clear search context
         await show_main_menu(update, context)
         set_user_state(user_id, CHOOSING)
         
+    elif data == "page_prev":
+        if user_id in SEARCH_CONTEXT:
+            SEARCH_CONTEXT[user_id]["page"] -= 1
+            await send_search_page(update, context, user_id, SEARCH_CONTEXT[user_id]["page"])
+            
+    elif data == "page_next":
+        if user_id in SEARCH_CONTEXT:
+            SEARCH_CONTEXT[user_id]["page"] += 1
+            await send_search_page(update, context, user_id, SEARCH_CONTEXT[user_id]["page"])
+            
     elif data == "nav_search":
         await query.message.reply_text("🔎 Please enter *Book Code* or *Name*:", parse_mode='Markdown', reply_markup=ReplyKeyboardRemove())
         set_user_state(user_id, SEARCHING_BOOK)
@@ -639,11 +806,56 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("🕘 Enter *Book Code*:", parse_mode='Markdown', reply_markup=ReplyKeyboardRemove())
         set_user_state(user_id, ISSUE_HISTORY)
 
+    # 4. Bot Users Management
+    elif data == "page_user_prev":
+        if user_id in USER_PAGINATION_CONTEXT:
+            USER_PAGINATION_CONTEXT[user_id]["page"] -= 1
+            await send_bot_users_page(update, context, user_id, USER_PAGINATION_CONTEXT[user_id]["page"])
+            
+    elif data == "page_user_next":
+        if user_id in USER_PAGINATION_CONTEXT:
+            USER_PAGINATION_CONTEXT[user_id]["page"] += 1
+            await send_bot_users_page(update, context, user_id, USER_PAGINATION_CONTEXT[user_id]["page"])
+
+    elif data.startswith("view_user_"):
+        target_id = int(data.split("_")[2])
+        await show_user_details(update, context, target_id)
+
+    elif data.startswith("role_"):
+        # Format: role_{action}_{target_id}
+        parts = data.split("_")
+        action = parts[1]
+        target_id = int(parts[2])
+        
+        if action == "approve":
+            await confirm_action(update, context, f"Approve user {target_id}?", f"conf_approve_{target_id}")
+        elif action == "block":
+            await confirm_action(update, context, f"Block user {target_id}?", f"conf_block_{target_id}")
+        elif action == "change":
+            await show_role_options(update, context, target_id)
+
+    elif data.startswith("conf_"):
+        parts = data.split("_")
+        action = parts[1]
+        target_id = int(parts[2])
+        
+        new_role = "Approved" if action == "approve" else "Blocked"
+        await update_user_role_api(update, context, target_id, new_role)
+
+    elif data.startswith("setrole_"):
+        parts = data.split("_")
+        role = parts[1]
+        target_id = int(parts[2])
+        await update_user_role_api(update, context, target_id, role)
+
 # --- UNIFIED HANDLERS ---
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Unified message handler that routes based on user state."""
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = user.id
+    await upsert_bot_user(user)
+    
     current_state = get_user_state(user_id)
     
     logger.info(f"Message from user {user_id} in state {current_state}: {update.message.text[:50]}")
@@ -683,6 +895,125 @@ def init_bot():
     application.add_handler(CallbackQueryHandler(handle_callback))
     
     return application
+
+async def send_bot_users_page(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_id: int, page: int):
+    """Displays a paginated list of bot users."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(f"{API_BASE}/get_bot_users", json={"page": page, "page_size": PAGE_SIZE})
+            res_data = response.json()
+            
+        if res_data["status"] != "ok":
+            await update.effective_message.reply_text("❌ Error fetching users.")
+            return
+
+        users = res_data["data"]["users"]
+        total_pages = res_data["data"]["total_pages"]
+        
+        msg = f"👥 *Bot Users* (Page {page}/{total_pages})\n\n"
+        keyboard = []
+        
+        for u in users:
+            masked_id = f"...{str(u['chat_id'])[-4:]}"
+            msg += f"👤 *{u['name']}* ({u['role']})\nID: `{masked_id}` | Joined: {u['joined_at'][:10]}\n\n"
+            keyboard.append([InlineKeyboardButton(f"🔍 View {u['name']}", callback_data=f"view_user_{u['chat_id']}")])
+            
+        nav_row = []
+        if page > 1:
+            nav_row.append(InlineKeyboardButton("⏮ Prev", callback_data="page_user_prev"))
+        if page < total_pages:
+            nav_row.append(InlineKeyboardButton("⏭ Next", callback_data="page_user_next"))
+        if nav_row:
+            keyboard.append(nav_row)
+            
+        keyboard.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="ana_back")])
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        else:
+            await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            
+    except Exception as e:
+        logger.error(f"Error in send_bot_users_page: {e}")
+        await update.effective_message.reply_text("❌ Failed to load users.")
+
+async def show_user_details(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int):
+    """Shows full details and management actions for a user."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(f"{API_BASE}/get_user_details", json={"chat_id": target_id})
+            res_data = response.json()
+            
+        if res_data["status"] != "ok":
+            await update.callback_query.answer("❌ User not found", show_alert=True)
+            return
+            
+        u = res_data["data"]
+        msg = (
+            f"👤 *User Details*\n\n"
+            f"📛 *Name:* {u['name']}\n"
+            f"🔖 *Username:* @{u['username'] if u['username'] else 'None'}\n"
+            f"🆔 *Chat ID:* `{u['chat_id']}`\n"
+            f"🎭 *Role:* {u['role']}\n"
+            f"📅 *Joined:* {u['joined_at']}\n"
+            f"🕒 *Last Active:* {u['last_active']}\n"
+            f"✅ *Approved By:* {u['approved_by'] if u['approved_by'] else 'N/A'}"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("✅ Approve", callback_data=f"role_approve_{target_id}"),
+             InlineKeyboardButton("⛔ Block", callback_data=f"role_block_{target_id}")],
+            [InlineKeyboardButton("🔁 Change Role", callback_data=f"role_change_{target_id}")],
+            [InlineKeyboardButton("🔙 Back to List", callback_data="page_user_back")]
+        ]
+        
+        await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"Error in show_user_details: {e}")
+        await update.callback_query.answer("❌ Failed to load details")
+
+async def confirm_action(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, callback_data: str):
+    keyboard = [
+        [InlineKeyboardButton("✅ Yes, Confirm", callback_data=callback_data)],
+        [InlineKeyboardButton("❌ Cancel", callback_data="page_user_back")]
+    ]
+    await update.callback_query.edit_message_text(f"⚠️ *Confirmation*\n\n{text}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+async def show_role_options(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int):
+    keyboard = [
+        [InlineKeyboardButton("Admin", callback_data=f"setrole_Admin_{target_id}")],
+        [InlineKeyboardButton("Approved", callback_data=f"setrole_Approved_{target_id}")],
+        [InlineKeyboardButton("Basic", callback_data=f"setrole_Basic_{target_id}")],
+        [InlineKeyboardButton("Blocked", callback_data=f"setrole_Blocked_{target_id}")],
+        [InlineKeyboardButton("🔙 Cancel", callback_data=f"view_user_{target_id}")]
+    ]
+    await update.callback_query.edit_message_text("🎭 *Select New Role*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+async def update_user_role_api(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int, role: str):
+    try:
+        admin_id = update.effective_user.id
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(f"{API_BASE}/update_user_role", json={
+                "chat_id": target_id,
+                "role": role,
+                "admin_id": admin_id
+            })
+            res_data = response.json()
+            
+        if res_data["status"] == "ok":
+            await update.callback_query.answer(f"✅ Role updated to {role}")
+            # If approved, update the in-memory set for immediate effect
+            if role == "Approved":
+                APPROVED_USERS.add(target_id)
+            elif role == "Blocked" and target_id in APPROVED_USERS:
+                APPROVED_USERS.remove(target_id)
+                
+            await show_user_details(update, context, target_id)
+        else:
+            await update.callback_query.answer("❌ Failed to update role")
+    except Exception as e:
+        logger.error(f"Error in update_user_role_api: {e}")
+        await update.callback_query.answer("❌ API Error")
 
 if __name__ == '__main__':
     if not BOT_RUNNING:
