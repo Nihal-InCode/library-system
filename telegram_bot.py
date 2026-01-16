@@ -22,7 +22,8 @@ from telegram.constants import ChatAction
 TOKEN = "8284783402:AAHkRaxmBOpJ4jYUzboH4cK3XQoRt2iK5Ow"
 ADMIN_CHAT_ID = 8291437833
 APPROVED_USERS: Set[int] = {ADMIN_CHAT_ID}  # Admin is always approved
-API_BASE = "http://127.0.0.1:5000"  # Flask backend URL
+PORT = int(os.environ.get("PORT", "8080"))
+API_BASE = os.environ.get("API_BASE", f"http://127.0.0.1:{PORT}")
 
 # --- LOGGING ---
 logging.basicConfig(
