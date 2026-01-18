@@ -104,16 +104,31 @@ def clear_user_state(user_id: int):
     """Clear state for user."""
     USER_STATES.pop(user_id, None)
 
+def ensure_user_context(user_id: int):
+    """Ensures the user has a valid entry in CLEANUP_CONTEXT with all keys."""
+    if user_id not in CLEANUP_CONTEXT:
+        CLEANUP_CONTEXT[user_id] = {}
+    
+    # Default structure
+    defaults = {
+        "menu_tap_id": None,
+        "prompt_id": None,
+        "last_result_id": None,
+        "tasks": {}
+    }
+    
+    for key, value in defaults.items():
+        if key not in CLEANUP_CONTEXT[user_id]:
+            CLEANUP_CONTEXT[user_id][key] = value
+
 def store_menu_tap(user_id: int, message_id: int):
     """Stores the message ID of a menu button tap."""
-    if user_id not in CLEANUP_CONTEXT:
-        CLEANUP_CONTEXT[user_id] = {"menu_tap_id": None, "prompt_id": None}
+    ensure_user_context(user_id)
     CLEANUP_CONTEXT[user_id]["menu_tap_id"] = message_id
 
 def store_prompt(user_id: int, message_id: int):
     """Stores the message ID of a bot prompt."""
-    if user_id not in CLEANUP_CONTEXT:
-        CLEANUP_CONTEXT[user_id] = {"menu_tap_id": None, "prompt_id": None, "last_result_id": None}
+    ensure_user_context(user_id)
     CLEANUP_CONTEXT[user_id]["prompt_id"] = message_id
 
 async def run_clean_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -123,16 +138,17 @@ async def run_clean_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if user_id in CLEANUP_CONTEXT:
         data = CLEANUP_CONTEXT[user_id]
-        if data["menu_tap_id"]:
+        if data.get("menu_tap_id"):
             await schedule_delete(context, chat_id, data["menu_tap_id"], QUICK_DELETE_SECONDS, show_vanish=True)
             data["menu_tap_id"] = None
-        if data["prompt_id"]:
+        if data.get("prompt_id"):
             await schedule_delete(context, chat_id, data["prompt_id"], QUICK_DELETE_SECONDS, show_vanish=True)
             data["prompt_id"] = None
             
     # Also delete the current user input message after a short delay
     if update.message:
-        await schedule_delete(context, chat_id, update.message.message_id, QUICK_DELETE_SECONDS, show_vanish=True)
+        # User messages cannot be edited, so show_vanish=False
+        await schedule_delete(context, chat_id, update.message.message_id, QUICK_DELETE_SECONDS, show_vanish=False)
 
 # --- MESSAGE CLEANUP HELPERS ---
 
@@ -153,7 +169,8 @@ async def _perform_scheduled_delete(context: ContextTypes.DEFAULT_TYPE, chat_id:
                 try:
                     await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=frame)
                 except Exception:
-                    pass # Ignore edit failures
+                    # If edit fails (e.g. 400 Bad Request), skip animation
+                    break
                 await asyncio.sleep(frame_delay)
         
         # 3. Final deletion
@@ -229,12 +246,12 @@ async def send_and_track_message(update: Update, context: ContextTypes.DEFAULT_T
         # 3. Track this message
         if is_result:
             # Results are tracked separately so they don't get deleted by the next Menu/Prompt
-            if user_id not in CLEANUP_CONTEXT:
-                CLEANUP_CONTEXT[user_id] = {"menu_tap_id": None, "prompt_id": None, "last_result_id": None}
+            ensure_user_context(user_id)
             
             # Delete previous result immediately if it exists (Keep only final result)
-            if CLEANUP_CONTEXT[user_id]["last_result_id"]:
-                await safe_delete_message(context, chat_id, CLEANUP_CONTEXT[user_id]["last_result_id"])
+            last_id = CLEANUP_CONTEXT[user_id].get("last_result_id")
+            if last_id:
+                await safe_delete_message(context, chat_id, last_id)
             
             CLEANUP_CONTEXT[user_id]["last_result_id"] = sent_msg.message_id
         else:
