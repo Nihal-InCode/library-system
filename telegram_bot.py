@@ -685,6 +685,9 @@ async def send_search_page(update: Update, context: ContextTypes.DEFAULT_TYPE, u
         else:
             await send_and_track_message(update, context, text=message_text, reply_markup=reply_markup, is_result=True)
             
+            # Send helper prompt for continuous input
+            await send_and_track_message(update, context, text="✅ Done. Enter another book name/code (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
+            
     except Exception as e:
         logger.error(f"Error in send_search_page: {e}")
         error_msg = "Failed to fetch results. Please try again."
@@ -692,8 +695,7 @@ async def send_search_page(update: Update, context: ContextTypes.DEFAULT_TYPE, u
             await update.callback_query.edit_message_text(error_msg)
         else:
             await send_and_track_message(update, context, text=error_msg, is_result=True)
-    
-    set_user_state(user_id, CHOOSING)
+            await send_and_track_message(update, context, text="⚠️ Try again. Enter another book name/code (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
 
 async def handle_book_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Processes book status request."""
@@ -758,8 +760,7 @@ async def handle_student_details(update: Update, context: ContextTypes.DEFAULT_T
         
         if data["status"] != "ok":
             await send_and_track_message(update, context, text="Student not found.")
-            await show_main_menu(update, context)
-            set_user_state(user_id, CHOOSING)
+            await send_and_track_message(update, context, text="⚠️ Try again. Enter another Student ID (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
             return
         
         student = data["data"]
@@ -813,10 +814,13 @@ async def handle_student_details(update: Update, context: ContextTypes.DEFAULT_T
         ]
         
         await send_and_track_message(update, context, text=msg, photo=photo_bytes, reply_markup=InlineKeyboardMarkup(keyboard), is_result=True)
+        
+        # Send helper prompt for continuous input
+        await send_and_track_message(update, context, text="✅ Done. Enter another Student ID (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
     except Exception as e:
         logger.error(f"Error fetching student details: {e}")
         await send_and_track_message(update, context, text="Failed to fetch student details. Please try again.")
-    set_user_state(user_id, CHOOSING)
+        await send_and_track_message(update, context, text="⚠️ Try again. Enter another Student ID (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
 
 async def handle_issue_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Processes issue history for a book."""
@@ -833,12 +837,14 @@ async def handle_issue_history(update: Update, context: ContextTypes.DEFAULT_TYP
         
         if data["status"] != "ok":
             await send_and_track_message(update, context, text="Failed to fetch history.")
+            await send_and_track_message(update, context, text="⚠️ Try again. Enter another book code (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
             return
         
         history = data["data"]["history"]
         
         if not history:
             await send_and_track_message(update, context, text="No transaction history found for this book code.")
+            await send_and_track_message(update, context, text="✅ Done. Enter another book code (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
         else:
             msg = (
                 f"📢 *Library Notice*\n\n"
@@ -856,10 +862,13 @@ async def handle_issue_history(update: Update, context: ContextTypes.DEFAULT_TYP
             
             keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="nav_menu")]]
             await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard), is_result=True)
+            
+            # Send helper prompt for continuous input
+            await send_and_track_message(update, context, text="✅ Done. Enter another book code (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
     except Exception as e:
         logger.error(f"Error fetching issue history: {e}")
         await send_and_track_message(update, context, text="Failed to fetch history. Please try again.")
-    set_user_state(user_id, CHOOSING)
+        await send_and_track_message(update, context, text="⚠️ Try again. Enter another book code (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
 
 async def handle_book_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Displays aggregate book counts."""
@@ -873,6 +882,7 @@ async def handle_book_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if data["status"] != "ok":
             await send_and_track_message(update, context, text="Error fetching book counts.")
+            await send_and_track_message(update, context, text="⚠️ Try again. Enter another book code (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
             return
         
         stats = data["data"]
@@ -885,9 +895,13 @@ async def handle_book_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"_Data accurate as of {stats['timestamp']}_"
         )
         await send_and_track_message(update, context, text=msg, is_result=True)
+        
+        # Send helper prompt for continuous input
+        await send_and_track_message(update, context, text="✅ Done. Enter another book code (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
     except Exception as e:
         logger.error(f"Error fetching library stats: {e}")
         await send_and_track_message(update, context, text="Failed to fetch library stats. Please try again.")
+        await send_and_track_message(update, context, text="⚠️ Try again. Enter another book code (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
         
     # If called from menu (update.message present), show menu again
     if update.message:
@@ -1752,3 +1766,4 @@ if __name__ == '__main__':
         app_instance.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
     else:
         logger.warning("Bot is already running. Skipping duplicate startup.")
+
