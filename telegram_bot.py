@@ -104,31 +104,16 @@ def clear_user_state(user_id: int):
     """Clear state for user."""
     USER_STATES.pop(user_id, None)
 
-def ensure_user_context(user_id: int):
-    """Ensures the user has a valid entry in CLEANUP_CONTEXT with all keys."""
-    if user_id not in CLEANUP_CONTEXT:
-        CLEANUP_CONTEXT[user_id] = {}
-    
-    # Default structure
-    defaults = {
-        "menu_tap_id": None,
-        "prompt_id": None,
-        "last_result_id": None,
-        "tasks": {}
-    }
-    
-    for key, value in defaults.items():
-        if key not in CLEANUP_CONTEXT[user_id]:
-            CLEANUP_CONTEXT[user_id][key] = value
-
 def store_menu_tap(user_id: int, message_id: int):
     """Stores the message ID of a menu button tap."""
-    ensure_user_context(user_id)
+    if user_id not in CLEANUP_CONTEXT:
+        CLEANUP_CONTEXT[user_id] = {"menu_tap_id": None, "prompt_id": None}
     CLEANUP_CONTEXT[user_id]["menu_tap_id"] = message_id
 
 def store_prompt(user_id: int, message_id: int):
     """Stores the message ID of a bot prompt."""
-    ensure_user_context(user_id)
+    if user_id not in CLEANUP_CONTEXT:
+        CLEANUP_CONTEXT[user_id] = {"menu_tap_id": None, "prompt_id": None, "last_result_id": None}
     CLEANUP_CONTEXT[user_id]["prompt_id"] = message_id
 
 async def run_clean_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -138,17 +123,16 @@ async def run_clean_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if user_id in CLEANUP_CONTEXT:
         data = CLEANUP_CONTEXT[user_id]
-        if data.get("menu_tap_id"):
+        if data["menu_tap_id"]:
             await schedule_delete(context, chat_id, data["menu_tap_id"], QUICK_DELETE_SECONDS, show_vanish=True)
             data["menu_tap_id"] = None
-        if data.get("prompt_id"):
+        if data["prompt_id"]:
             await schedule_delete(context, chat_id, data["prompt_id"], QUICK_DELETE_SECONDS, show_vanish=True)
             data["prompt_id"] = None
             
     # Also delete the current user input message after a short delay
     if update.message:
-        # User messages cannot be edited, so show_vanish=False
-        await schedule_delete(context, chat_id, update.message.message_id, QUICK_DELETE_SECONDS, show_vanish=False)
+        await schedule_delete(context, chat_id, update.message.message_id, QUICK_DELETE_SECONDS, show_vanish=True)
 
 # --- MESSAGE CLEANUP HELPERS ---
 
@@ -169,8 +153,7 @@ async def _perform_scheduled_delete(context: ContextTypes.DEFAULT_TYPE, chat_id:
                 try:
                     await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=frame)
                 except Exception:
-                    # If edit fails (e.g. 400 Bad Request), skip animation
-                    break
+                    pass # Ignore edit failures
                 await asyncio.sleep(frame_delay)
         
         # 3. Final deletion
@@ -246,12 +229,12 @@ async def send_and_track_message(update: Update, context: ContextTypes.DEFAULT_T
         # 3. Track this message
         if is_result:
             # Results are tracked separately so they don't get deleted by the next Menu/Prompt
-            ensure_user_context(user_id)
+            if user_id not in CLEANUP_CONTEXT:
+                CLEANUP_CONTEXT[user_id] = {"menu_tap_id": None, "prompt_id": None, "last_result_id": None}
             
             # Delete previous result immediately if it exists (Keep only final result)
-            last_id = CLEANUP_CONTEXT[user_id].get("last_result_id")
-            if last_id:
-                await safe_delete_message(context, chat_id, last_id)
+            if CLEANUP_CONTEXT[user_id]["last_result_id"]:
+                await safe_delete_message(context, chat_id, CLEANUP_CONTEXT[user_id]["last_result_id"])
             
             CLEANUP_CONTEXT[user_id]["last_result_id"] = sent_msg.message_id
         else:
@@ -271,6 +254,29 @@ def is_admin(user_id: int) -> bool:
 
 def is_authorized(user_id: int) -> bool:
     return is_admin(user_id) or user_id in APPROVED_USERS
+
+async def can_access_advanced_analytics(user_id: int) -> bool:
+    """Check if user can access Advanced Analytics."""
+    # Admin always has access
+    if is_admin(user_id):
+        return True
+    
+    # Check if user is approved in memory set
+    if user_id in APPROVED_USERS:
+        return True
+    
+    # Check database for approved role
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.post(f"{API_BASE}/get_user_role", json={"chat_id": user_id})
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("status") == "ok" and data.get("role") in ["Approved", "Admin"]:
+                    return True
+    except Exception as e:
+        logger.error(f"Error checking user role for {user_id}: {e}")
+    
+    return False
 
 async def log_user_action(user, action, details=""):
     """Logs a user action to the backend audit trail."""
@@ -493,7 +499,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await request_admin_approval(update, context)
     
     elif text == "📊 Advanced Analytics":
-        if not is_admin(user_id):
+        if not await can_access_advanced_analytics(user_id):
             await send_and_track_message(update, context, text="🔒 *Admin Only*\nThis section is restricted to administrators.")
             set_user_state(user_id, CHOOSING)
             return
@@ -912,6 +918,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Admin approved user {target_id}")
             await log_admin_action(user_id, "Approve User", target_id)
             
+            # Update user role in database
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    await client.post(f"{API_BASE}/update_user_role", json={
+                        "chat_id": target_id,
+                        "role": "Approved",
+                        "admin_id": user_id
+                    })
+                logger.info(f"Updated user {target_id} role to Approved in database")
+            except Exception as e:
+                logger.error(f"Failed to update user role in database: {e}")
+            
             # Update Admin Message
             try:
                 if query.message.caption:
@@ -935,7 +953,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "✅ *Your access has been approved.*\n\n"
                         "You can now use all features including:\n"
                         "• 👤 Student Profile\n"
-                        "• 🕘 Reading History\n\n"
+                        "• 🕘 Reading History\n"
+                        "• 📊 Advanced Analytics\n\n"
                         "Use /start to see the updated menu."
                     ),
                     parse_mode='Markdown'
@@ -1045,7 +1064,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 3. Analytics Actions
     if data.startswith("ana_"):
-        if not is_admin(user_id):
+        if not await can_access_advanced_analytics(user_id):
             await query.answer("🔒 Admin only", show_alert=True)
             return
             
