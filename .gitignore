@@ -1,0 +1,53 @@
+# Environment variables (contains secrets)
+.env
+.env.local
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database files (contains user data)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.bak_*
+
+# Logs
+*.log
+
+# Build
+dist/
+build/
+*.egg-info/
+
+# Compiled executables
+*.exe
+
+# Temporary files
+temp_*
+
+# Student photos (personal data)
+images/17*.jpg
+images/HS.jpg
+images/MP.jpg
+images/default.jpg
+images/student_id.jpg
+images/1111.jpg
+images/JM.JPG

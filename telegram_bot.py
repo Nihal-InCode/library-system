@@ -20,9 +20,12 @@ from telegram.ext import (
 )
 from telegram.constants import ChatAction
 
+# Import shared Telegram utilities
+from telegram_utils import get_bot_token, get_admin_chat_id
+
 # --- CONFIGURATION ---
-TOKEN = "8284783402:AAHkRaxmBOpJ4jYUzboH4cK3XQoRt2iK5Ow"
-ADMIN_CHAT_ID = 8291437833
+TOKEN = get_bot_token()
+ADMIN_CHAT_ID = get_admin_chat_id()
 APPROVED_USERS: Set[int] = {ADMIN_CHAT_ID}  # Admin is always approved
 PORT = int(os.environ.get("PORT", "8080"))
 API_BASE = os.environ.get("API_BASE", f"http://127.0.0.1:{PORT}")
@@ -571,8 +574,8 @@ async def show_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("👤 User History", callback_data="admin_user_history")],
         [InlineKeyboardButton("🛡 Admin Audit", callback_data="admin_audit")],
         [InlineKeyboardButton("🔄 Reset User", callback_data="admin_reset")],
-        [InlineKeyboardButton("� DB Tools", callback_data="admin_db")],
-        [InlineKeyboardButton("�🔙 Back to Main Menu", callback_data="nav_menu")]
+        [InlineKeyboardButton("🗄 DB Tools", callback_data="admin_db")],
+        [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="nav_menu")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await send_and_track_message(update, context, text="👑 *Quick Admin Dashboard*\nSelect a management tool:", reply_markup=reply_markup)
@@ -649,17 +652,18 @@ async def send_search_page(update: Update, context: ContextTypes.DEFAULT_TYPE, u
             return
 
         # Format results into a single professional message
-        message_text = f"📢 *Library Notice*\n\n📘 *Search Results for:* `{term}`\n"
-        message_text += f"🔢 *Total Found:* {total_count}\n"
-        message_text += f"📄 *Page:* {page}/{total_pages}\n\n"
+        message_text = f"🔍 *Search Results*\n\n"
+        message_text += f"📗 *Query:* `{term}`\n"
+        message_text += f"📊 *Found:* {total_count} result(s) — Page {page}/{total_pages}\n\n"
         
         for book in books:
             status_icon = "✅" if book["available"] > 0 else "❌"
+            status_text = "Available" if book['available'] > 0 else "Issued"
             message_text += (
-                f"📚 *Code:* `{book['id']}`\n"
-                f"📘 *Title:* {book['title']}\n"
-                f"📊 *Status:* {status_icon} {'Available' if book['available'] > 0 else 'Issued'}\n"
-                f"-------------------\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"📘 *{book['title']}*\n"
+                f"🔖 Code: `{book['id']}`\n"
+                f"📊 Status: {status_icon} *{status_text}*\n"
             )
 
         # Build pagination keyboard
@@ -718,9 +722,8 @@ async def handle_book_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
         state_text = "✅ Available" if book["available"] > 0 else "❌ Issued"
         
         msg = (
-            f"📢 *Library Notice*\n\n"
-            f"📖 *Book Status Report*\n\n"
-            f"📚 *Book Code:* `{book['id']}`\n"
+            f"📖 *Book Status*\n\n"
+            f"🔖 *Code:* `{book['id']}`\n"
             f"📘 *Title:* {book['title']}\n"
             f"📊 *Status:* {state_text}\n"
         )
@@ -780,13 +783,13 @@ async def handle_student_details(update: Update, context: ContextTypes.DEFAULT_T
         msg = ""
         if not issued_books and not returned_books:
             msg = (
-                f"📢 *Library Notice*\n\n👤 *Student Profile*\n\n"
-                f"📛 *Name:* {student['name']}\n🏫 *Batch:* {student['batch']}\n\n"
+                f"👤 *Student Profile*\n\n"
+                f"📛 *Name:* {student['name']}\n"
+                f"🏫 *Batch:* {student['batch']}\n\n"
                 f"No records found for this student."
             )
         else:
             msg = (
-                f"📢 *Library Notice*\n\n"
                 f"👤 *Student Profile*\n\n"
                 f"📛 *Name:* {student['name']}\n"
                 f"🏫 *Batch:* {student['batch']}\n\n"
@@ -795,16 +798,16 @@ async def handle_student_details(update: Update, context: ContextTypes.DEFAULT_T
             msg += "📚 *Currently Issued:*\n"
             if issued_books:
                 for book in issued_books:
-                    msg += f"- `{book['id']}` – {book['title']} (Issued: {book['issue_date']})\n"
+                    msg += f"• `{book['id']}` — {book['title']} (Issued: {book['issue_date']})\n"
             else:
-                msg += "- None\n"
+                msg += "• None\n"
                 
             msg += "\n📜 *Returned Books:*\n"
             if returned_books:
                 for book in returned_books:
-                    msg += f"- `{book['id']}` – {book['title']} ({book['issue_date']} → {book['return_date']})\n"
+                    msg += f"• `{book['id']}` — {book['title']} ({book['issue_date']} → {book['return_date']})\n"
             else:
-                msg += "- None\n"
+                msg += "• None\n"
         
         # Inline Navigation - Smart Actions
         keyboard = [
@@ -847,17 +850,17 @@ async def handle_issue_history(update: Update, context: ContextTypes.DEFAULT_TYP
             await send_and_track_message(update, context, text="✅ Done. Enter another book code (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
         else:
             msg = (
-                f"📢 *Library Notice*\n\n"
-                f"🕘 *Transaction History*\n"
-                f"_Last 5 transactions for_ `{book_id}`\n\n"
+                f"🕘 *Transaction History*\n\n"
+                f"📖 *Book:* `{book_id}`\n"
+                f"📋 *Recent Transactions:* {len(history)}\n\n"
             )
             for trans in history:
-                ret_text = trans["return_date"] if trans["return_date"] else "Not Returned"
+                ret_text = trans["return_date"] if trans["return_date"] else "_Pending_"
                 msg += (
+                    f"━━━━━━━━━━━━━━━━━━━\n"
                     f"👤 *{trans['name']}*\n"
-                    f"📅 *Issued:* {trans['issue_date']}\n"
-                    f"📅 *Returned:* {ret_text}\n"
-                    f"---\n"
+                    f"📅 Issued: {trans['issue_date']}\n"
+                    f"📅 Returned: {ret_text}\n"
                 )
             
             keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="nav_menu")]]
@@ -887,12 +890,11 @@ async def handle_book_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         stats = data["data"]
         msg = (
-            f"📢 *Library Notice*\n\n"
-            f"📊 *Library Analytics*\n\n"
+            f"📊 *Library Statistics*\n\n"
             f"📚 *Total Unique Books:* {stats['total_books']}\n"
             f"✅ *Available Copies:* {stats['available_copies']}\n"
             f"📖 *Currently Issued:* {stats['issued_books']}\n\n"
-            f"_Data accurate as of {stats['timestamp']}_"
+            f"_Last updated: {stats['timestamp']}_"
         )
         await send_and_track_message(update, context, text=msg, is_result=True)
         

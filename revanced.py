@@ -22,6 +22,9 @@ import os, time
 from urllib.parse import quote
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
+# Import shared Telegram utilities
+from telegram_utils import send_message, send_photo
+
 class GlassButton(ctk.CTkFrame):
     """Liquid Glass Button with hover effects"""
     
@@ -183,17 +186,15 @@ def get_teacher_chat_id(batch: str) -> int:
     return BATCH_TEACHERS.get(batch, 0)
 #SANITISE
 
-# ------------------ WhatsApp Setup ------------------ #
-# ------------------ WhatsApp Setup ------------------ #
 from typing import Optional
 
-# ------------------ WhatsApp Setup ------------------ #
 
 def send_telegram_message(chat_id: int, text: str, image_path: Optional[str] = None):
-    bot_token = "8284783402:AAHkRaxmBOpJ4jYUzboH4cK3XQoRt2iK5Ow"
-    if not bot_token:
-        print("⚠️ TELEGRAM_BOT_TOKEN is not set")
-        return False
+    """Wrapper function using shared telegram_utils module."""
+    if image_path and os.path.exists(image_path):
+        return send_photo(chat_id, image_path, text)
+    else:
+        return send_message(chat_id, text)
 
     if not chat_id:
         print("⚠️ Telegram chat_id not configured")
@@ -1046,23 +1047,20 @@ class IslamicLibraryApp(ctk.CTk):
     def _format_issue_caption(self, student_name, batch, book_title, due_date):
         formatted_due = datetime.strptime(due_date, '%Y-%m-%d').strftime('%d-%b-%Y')
         return (
-            "📢 *Library Notice*\n\n"
-            "📚 *Book Issued Successfully*\n\n"
+            "📚 *Book Issued*\n\n"
             f"👤 *Student:* {student_name} ({batch})\n"
             f"📘 *Book:* {book_title}\n"
             f"📅 *Due Date:* {formatted_due}\n\n"
-            "🙏 _Please remind the student to return the book on or before the due date._"
+            "_Please ensure timely return._"
         )
-    
+
     def _format_return_caption(self, student_name, batch, book_title, rating=None):
         return_date = datetime.now().strftime('%d-%b-%Y')
         msg = (
-            "📢 *Library Notice*\n\n"
             "✅ *Book Returned*\n\n"
             f"👤 *Student:* {student_name} ({batch})\n"
             f"📘 *Book:* {book_title}\n"
-            f"📅 *Returned On:* {return_date}\n\n"
-            "🙏 _Thank you for your cooperation._"
+            f"📅 *Returned On:* {return_date}"
         )
         if rating and rating > 0:
             msg += f"\n⭐ *Rating:* {rating}/5"
