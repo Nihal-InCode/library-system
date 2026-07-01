@@ -413,11 +413,40 @@ def analytics_overdue():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # --- DATABASE INITIALIZATION ---
-def init_bot_users_db():
-    """Initialize the bot_users table if it doesn't exist."""
+def init_db():
+    """Create all required tables if they don't exist."""
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
+        # Core library tables
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS books (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                author TEXT,
+                category TEXT,
+                available_copies INTEGER DEFAULT 1
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS members (
+                student_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                batch TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_id TEXT,
+                member_id TEXT,
+                issue_date TEXT,
+                due_date TEXT,
+                return_date TEXT,
+                status TEXT DEFAULT 'issued'
+            )
+        """)
+        # Bot user tables
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS bot_users (
                 chat_id INTEGER PRIMARY KEY,
@@ -429,7 +458,7 @@ def init_bot_users_db():
                 approved_by INTEGER
             )
         """)
-        # Audit Tables
+        # Audit tables
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS bot_user_actions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -453,7 +482,7 @@ def init_bot_users_db():
         """)
         conn.commit()
     except Exception as e:
-        logger.error(f"Error initializing audit tables: {e}")
+        logger.error(f"Error initializing database: {e}")
     finally:
         conn.close()
 
@@ -735,16 +764,12 @@ def internal_error(error):
 
 # --- MAIN ---
 if __name__ == '__main__':
-    if not os.path.exists(DB_PATH):
-        logger.error(f"Database file NOT FOUND at: {DB_PATH}")
-        exit(1)
-    
-    init_bot_users_db()
-    
+    init_db()
+
     if not os.path.exists(IMAGES_DIR):
         os.makedirs(IMAGES_DIR)
         logger.info(f"Created images directory: {IMAGES_DIR}")
-    
+
     port = int(os.environ.get("PORT", 5000))
     logger.info(f"Python Brain Backend starting on port {port}...")
     app.run(host='0.0.0.0', port=port, debug=False)
