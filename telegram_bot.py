@@ -421,17 +421,6 @@ def is_authorized(user_id: int) -> bool:
     APPROVED_USERS.update(_load_approved_users())
     return user_id in APPROVED_USERS
 
-def is_authorized(user_id: int) -> bool:
-    if is_admin(user_id):
-        return True
-    if user_id in APPROVED_USERS:
-        return True
-    # Fallback: check database for persistent role (survives restarts)
-    if _check_db_auth(user_id):
-        APPROVED_USERS.add(user_id)
-        return True
-    return False
-
 async def log_user_action(user, action, details=""):
     """Logs a user action to the backend audit trail."""
     try:
@@ -755,7 +744,7 @@ async def show_admin_db_tools(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         await send_and_track_message(update, context, text=msg, reply_markup=reply_markup)
     
-    set_user_state(user_id, ADMIN_DB_TOOLS)
+    set_user_state(user_id, ADMIN_DASHBOARD)
 
 async def handle_search_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Processes search book request and initializes pagination."""
