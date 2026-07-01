@@ -324,8 +324,28 @@ async def send_and_track_message(update: Update, context: ContextTypes.DEFAULT_T
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_CHAT_ID
 
+def _check_db_auth(user_id: int) -> bool:
+    """Check if user is authorized via database role."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5)
+        cursor = conn.cursor()
+        cursor.execute("SELECT role FROM bot_users WHERE chat_id = ?", (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return row is not None and row[0] in ("Approved", "Admin")
+    except Exception:
+        return False
+
 def is_authorized(user_id: int) -> bool:
-    return is_admin(user_id) or user_id in APPROVED_USERS
+    if is_admin(user_id):
+        return True
+    if user_id in APPROVED_USERS:
+        return True
+    # Fallback: check database for persistent role (survives restarts)
+    if _check_db_auth(user_id):
+        APPROVED_USERS.add(user_id)
+        return True
+    return False
 
 async def log_user_action(user, action, details=""):
     """Logs a user action to the backend audit trail."""
@@ -967,6 +987,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             
             APPROVED_USERS.add(target_id)
+            
+            # Persist approval to database (survives restarts)
+            try:
+                conn = sqlite3.connect(DB_PATH, timeout=5)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO bot_users (chat_id, role, approved_by) VALUES (?, 'Approved', ?) "
+                    "ON CONFLICT(chat_id) DO UPDATE SET role = 'Approved', approved_by = ?",
+                    (target_id, user_id, user_id)
+                )
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                logger.error(f"Failed to persist approval to DB: {e}")
+            
             logger.info(f"Admin approved user {target_id}")
             await log_admin_action(user_id, "Approve User", target_id)
             
@@ -1009,6 +1044,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Admin declined user {target_id}")
             await log_admin_action(user_id, "Decline User", target_id)
             
+            # Persist decline to database
+            try:
+                conn = sqlite3.connect(DB_PATH, timeout=5)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO bot_users (chat_id, role) VALUES (?, 'Blocked') "
+                    "ON CONFLICT(chat_id) DO UPDATE SET role = 'Blocked'",
+                    (target_id,)
+                )
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                logger.error(f"Failed to persist decline to DB: {e}")
+            
             # Update Admin Message
             try:
                 if query.message.caption:
@@ -1041,8 +1090,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             await query.answer("❌ User declined", show_alert=False)
         
-        return
-
         return
     
     # 5. Admin Dashboard Actions
