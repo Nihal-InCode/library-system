@@ -54,6 +54,7 @@ def _load_approved_users() -> Set[int]:
 def _push_approved_users_to_github():
     """Push approved_users.txt to GitHub so it survives Railway redeploys."""
     if not GITHUB_TOKEN:
+        logger.warning("GITHUB_TOKEN not set — approved users won't persist across deploys")
         return
     try:
         import requests as req
@@ -106,15 +107,8 @@ def _save_approved_users():
         logger.error(f"Failed to save approved users: {e}")
         return
 
-    # Push to GitHub in background (don't block the bot)
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            threading.Thread(target=_push_approved_users_to_github, daemon=True).start()
-        else:
-            _push_approved_users_to_github()
-    except Exception:
-        threading.Thread(target=_push_approved_users_to_github, daemon=True).start()
+    # Push to GitHub synchronously so it completes before deploy kills the process
+    _push_approved_users_to_github()
 
 APPROVED_USERS: Set[int] = {ADMIN_CHAT_ID}  # Admin is always approved
 APPROVED_USERS.update(_load_approved_users())  # Load persisted approvals
