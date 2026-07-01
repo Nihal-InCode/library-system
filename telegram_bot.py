@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import threading
 from datetime import datetime
 from typing import Set, Dict, Any
 import httpx
@@ -32,6 +33,10 @@ DB_PATH = "islamic_library.db"
 APPROVED_USERS_FILE = "approved_users.txt"
 
 # --- PERSISTED APPROVALS (file-based, survives DB replacements) ---
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITHUB_REPO = "Nihal-InCode/library-system"
+GITHUB_BRANCH = "main"
+
 def _load_approved_users() -> Set[int]:
     """Load approved user IDs from file."""
     users = set()
@@ -46,14 +51,70 @@ def _load_approved_users() -> Set[int]:
         pass
     return users
 
+def _push_approved_users_to_github():
+    """Push approved_users.txt to GitHub so it survives Railway redeploys."""
+    if not GITHUB_TOKEN:
+        return
+    try:
+        import requests as req
+
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        api_base = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{APPROVED_USERS_FILE}"
+
+        # Get current file SHA (needed for updates)
+        sha = None
+        try:
+            r = req.get(api_base, headers=headers, timeout=10)
+            if r.status_code == 200:
+                sha = r.json().get("sha")
+        except Exception:
+            pass
+
+        # Read file content
+        with open(APPROVED_USERS_FILE, "r") as f:
+            content = f.read()
+        import base64
+        encoded = base64.b64encode(content.encode()).decode()
+
+        # Create or update file
+        payload = {
+            "message": "chore: update approved users",
+            "content": encoded,
+            "branch": GITHUB_BRANCH
+        }
+        if sha:
+            payload["sha"] = sha
+
+        r = req.put(api_base, json=payload, headers=headers, timeout=15)
+        if r.status_code in (200, 201):
+            logger.info("Approved users pushed to GitHub successfully")
+        else:
+            logger.error(f"GitHub push failed: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        logger.error(f"Failed to push approved users to GitHub: {e}")
+
 def _save_approved_users():
-    """Save approved user IDs to file."""
+    """Save approved user IDs to file AND push to GitHub."""
     try:
         with open(APPROVED_USERS_FILE, "w") as f:
             for uid in APPROVED_USERS:
                 f.write(f"{uid}\n")
     except Exception as e:
         logger.error(f"Failed to save approved users: {e}")
+        return
+
+    # Push to GitHub in background (don't block the bot)
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            threading.Thread(target=_push_approved_users_to_github, daemon=True).start()
+        else:
+            _push_approved_users_to_github()
+    except Exception:
+        threading.Thread(target=_push_approved_users_to_github, daemon=True).start()
 
 APPROVED_USERS: Set[int] = {ADMIN_CHAT_ID}  # Admin is always approved
 APPROVED_USERS.update(_load_approved_users())  # Load persisted approvals
