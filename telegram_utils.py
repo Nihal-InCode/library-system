@@ -32,15 +32,32 @@ def send_message(
     parse_mode: str = "HTML",
     token: Optional[str] = None,
 ) -> bool:
-    """Send a text message via Telegram Bot API."""
+    """
+    Send a text message via Telegram Bot API.
+    
+    Args:
+        chat_id: Target chat ID
+        text: Message text
+        parse_mode: Parse mode (HTML or Markdown)
+        token: Bot token (uses default if not provided)
+    
+    Returns:
+        True if sent successfully, False otherwise
+    """
     if token is None:
         token = get_bot_token()
+    
     if not chat_id:
         print("Warning: Telegram chat_id not configured")
         return False
+    
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": parse_mode,
+        }
         response = requests.post(url, json=payload, timeout=10)
         return response.status_code == 200
     except Exception as e:
@@ -55,20 +72,38 @@ def send_photo(
     parse_mode: str = "HTML",
     token: Optional[str] = None,
 ) -> bool:
-    """Send a photo with optional caption via Telegram Bot API."""
+    """
+    Send a photo with optional caption via Telegram Bot API.
+    
+    Args:
+        chat_id: Target chat ID
+        photo_path: Path to the photo file
+        caption: Optional caption text
+        parse_mode: Parse mode (HTML or Markdown)
+        token: Bot token (uses default if not provided)
+    
+    Returns:
+        True if sent successfully, False otherwise
+    """
     if token is None:
         token = get_bot_token()
+    
     if not chat_id:
         print("Warning: Telegram chat_id not configured")
         return False
+    
     if not os.path.exists(photo_path):
         print(f"Warning: Photo not found at {photo_path}")
         return False
+    
     try:
         url = f"https://api.telegram.org/bot{token}/sendPhoto"
         with open(photo_path, "rb") as f:
             files = {"photo": f}
-            data = {"chat_id": chat_id, "parse_mode": parse_mode}
+            data = {
+                "chat_id": chat_id,
+                "parse_mode": parse_mode,
+            }
             if caption:
                 data["caption"] = caption
             response = requests.post(url, data=data, files=files, timeout=30)
@@ -84,11 +119,24 @@ def send_message_to_multiple(
     parse_mode: str = "HTML",
     token: Optional[str] = None,
 ) -> dict:
-    """Send a message to multiple chat IDs. Returns dict with success count and errors."""
+    """
+    Send a message to multiple chat IDs.
+    
+    Args:
+        chat_ids: List of target chat IDs
+        text: Message text
+        parse_mode: Parse mode (HTML or Markdown)
+        token: Bot token (uses default if not provided)
+    
+    Returns:
+        Dict with 'success' count and 'errors' list
+    """
     if token is None:
         token = get_bot_token()
+    
     success_count = 0
     errors = []
+    
     for chat_id in chat_ids:
         if not chat_id:
             continue
@@ -96,6 +144,7 @@ def send_message_to_multiple(
             success_count += 1
         else:
             errors.append(f"Chat {chat_id}: Failed to send")
+    
     return {"success": success_count, "errors": errors}
 
 
@@ -106,11 +155,25 @@ def send_photo_to_multiple(
     parse_mode: str = "HTML",
     token: Optional[str] = None,
 ) -> dict:
-    """Send a photo to multiple chat IDs. Returns dict with success count and errors."""
+    """
+    Send a photo to multiple chat IDs.
+    
+    Args:
+        chat_ids: List of target chat IDs
+        photo_path: Path to the photo file
+        caption: Optional caption text
+        parse_mode: Parse mode (HTML or Markdown)
+        token: Bot token (uses default if not provided)
+    
+    Returns:
+        Dict with 'success' count and 'errors' list
+    """
     if token is None:
         token = get_bot_token()
+    
     success_count = 0
     errors = []
+    
     for chat_id in chat_ids:
         if not chat_id:
             continue
@@ -118,4 +181,5 @@ def send_photo_to_multiple(
             success_count += 1
         else:
             errors.append(f"Chat {chat_id}: Failed to send photo")
+    
     return {"success": success_count, "errors": errors}

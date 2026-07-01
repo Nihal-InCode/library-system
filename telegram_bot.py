@@ -107,16 +107,31 @@ def clear_user_state(user_id: int):
     """Clear state for user."""
     USER_STATES.pop(user_id, None)
 
+def ensure_user_context(user_id: int):
+    """Ensures the user has a valid entry in CLEANUP_CONTEXT with all keys."""
+    if user_id not in CLEANUP_CONTEXT:
+        CLEANUP_CONTEXT[user_id] = {}
+    
+    # Default structure
+    defaults = {
+        "menu_tap_id": None,
+        "prompt_id": None,
+        "last_result_id": None,
+        "tasks": {}
+    }
+    
+    for key, value in defaults.items():
+        if key not in CLEANUP_CONTEXT[user_id]:
+            CLEANUP_CONTEXT[user_id][key] = value
+
 def store_menu_tap(user_id: int, message_id: int):
     """Stores the message ID of a menu button tap."""
-    if user_id not in CLEANUP_CONTEXT:
-        CLEANUP_CONTEXT[user_id] = {"menu_tap_id": None, "prompt_id": None}
+    ensure_user_context(user_id)
     CLEANUP_CONTEXT[user_id]["menu_tap_id"] = message_id
 
 def store_prompt(user_id: int, message_id: int):
     """Stores the message ID of a bot prompt."""
-    if user_id not in CLEANUP_CONTEXT:
-        CLEANUP_CONTEXT[user_id] = {"menu_tap_id": None, "prompt_id": None, "last_result_id": None}
+    ensure_user_context(user_id)
     CLEANUP_CONTEXT[user_id]["prompt_id"] = message_id
 
 async def run_clean_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -126,16 +141,17 @@ async def run_clean_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if user_id in CLEANUP_CONTEXT:
         data = CLEANUP_CONTEXT[user_id]
-        if data["menu_tap_id"]:
+        if data.get("menu_tap_id"):
             await schedule_delete(context, chat_id, data["menu_tap_id"], QUICK_DELETE_SECONDS, show_vanish=True)
             data["menu_tap_id"] = None
-        if data["prompt_id"]:
+        if data.get("prompt_id"):
             await schedule_delete(context, chat_id, data["prompt_id"], QUICK_DELETE_SECONDS, show_vanish=True)
             data["prompt_id"] = None
             
     # Also delete the current user input message after a short delay
     if update.message:
-        await schedule_delete(context, chat_id, update.message.message_id, QUICK_DELETE_SECONDS, show_vanish=True)
+        # User messages cannot be edited, so show_vanish=False
+        await schedule_delete(context, chat_id, update.message.message_id, QUICK_DELETE_SECONDS, show_vanish=False)
 
 # --- MESSAGE CLEANUP HELPERS ---
 
@@ -156,7 +172,8 @@ async def _perform_scheduled_delete(context: ContextTypes.DEFAULT_TYPE, chat_id:
                 try:
                     await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=frame)
                 except Exception:
-                    pass # Ignore edit failures
+                    # If edit fails (e.g. 400 Bad Request), skip animation
+                    break
                 await asyncio.sleep(frame_delay)
         
         # 3. Final deletion
@@ -232,12 +249,12 @@ async def send_and_track_message(update: Update, context: ContextTypes.DEFAULT_T
         # 3. Track this message
         if is_result:
             # Results are tracked separately so they don't get deleted by the next Menu/Prompt
-            if user_id not in CLEANUP_CONTEXT:
-                CLEANUP_CONTEXT[user_id] = {"menu_tap_id": None, "prompt_id": None, "last_result_id": None}
+            ensure_user_context(user_id)
             
             # Delete previous result immediately if it exists (Keep only final result)
-            if CLEANUP_CONTEXT[user_id]["last_result_id"]:
-                await safe_delete_message(context, chat_id, CLEANUP_CONTEXT[user_id]["last_result_id"])
+            last_id = CLEANUP_CONTEXT[user_id].get("last_result_id")
+            if last_id:
+                await safe_delete_message(context, chat_id, last_id)
             
             CLEANUP_CONTEXT[user_id]["last_result_id"] = sent_msg.message_id
         else:
@@ -257,29 +274,6 @@ def is_admin(user_id: int) -> bool:
 
 def is_authorized(user_id: int) -> bool:
     return is_admin(user_id) or user_id in APPROVED_USERS
-
-async def can_access_advanced_analytics(user_id: int) -> bool:
-    """Check if user can access Advanced Analytics."""
-    # Admin always has access
-    if is_admin(user_id):
-        return True
-    
-    # Check if user is approved in memory set
-    if user_id in APPROVED_USERS:
-        return True
-    
-    # Check database for approved role
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.post(f"{API_BASE}/get_user_role", json={"chat_id": user_id})
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("status") == "ok" and data.get("role") in ["Approved", "Admin"]:
-                    return True
-    except Exception as e:
-        logger.error(f"Error checking user role for {user_id}: {e}")
-    
-    return False
 
 async def log_user_action(user, action, details=""):
     """Logs a user action to the backend audit trail."""
@@ -327,15 +321,15 @@ async def request_admin_approval(update: Update, context: ContextTypes.DEFAULT_T
     
     # Check if already approved
     if is_authorized(user_id):
-        await send_and_track_message(update, context, text="✅ You already have full access to all features.")
+        await send_and_track_message(update, context, text="✅ *Access Granted*\n\nYou already have full access to all features.")
         set_user_state(user_id, CHOOSING)
         return
     
     # Notify User
     await send_and_track_message(update, context, text=(
         "🔐 *Access Request*\n\n"
-        "Sending your request to the admin...\n"
-        "You will be notified once it's reviewed."
+        "Your request is being sent to the administrator.\n"
+        "You will receive a notification once it has been reviewed."
     ))
     
     # Build admin notification message
@@ -349,7 +343,7 @@ async def request_admin_approval(update: Update, context: ContextTypes.DEFAULT_T
         f"👤 *Name:* {full_name}\n"
         f"🔖 *Username:* {username}\n"
         f"🆔 *User ID:* `{user_id}`\n\n"
-        f"Approve this user?"
+        f"Would you like to approve this user?"
     )
     
     keyboard = [
@@ -382,14 +376,14 @@ async def request_admin_approval(update: Update, context: ContextTypes.DEFAULT_T
             logger.info(f"Access request sent to admin for user {user_id} (no photo)")
     except Exception as e:
         logger.error(f"Failed to send admin request for user {user_id}: {e}")
-        await send_and_track_message(update, context, text="⚠️ Failed to send request. Please try again later.")
+        await send_and_track_message(update, context, text="⚠️ *Request Failed*\n\nUnable to send your request. Please try again later.")
         set_user_state(user_id, CHOOSING)
         return
 
     await send_and_track_message(update, context, text=(
-        "✅ *Request Sent Successfully*\n\n"
-        "The admin will review your request.\n"
-        "You will be notified once a decision is made."
+        "✅ *Request Sent*\n\n"
+        "Your access request has been submitted successfully.\n"
+        "The administrator will review it and notify you of the decision."
     ))
     set_user_state(user_id, CHOOSING)
 
@@ -407,7 +401,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Main menu sent to user {user.id}")
     except Exception as e:
         logger.error(f"Error in start handler: {e}", exc_info=True)
-        await send_and_track_message(update, context, text="Sorry, an error occurred. Please try again.")
+        await send_and_track_message(update, context, text="⚠️ *Error*\n\nAn unexpected error occurred. Please try again.")
         clear_user_state(user.id)
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -421,7 +415,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     USER_PAGINATION_CONTEXT.pop(user_id, None)
     ANALYTICS_CONTEXT.pop(user_id, None)
     
-    await send_and_track_message(update, context, text="❌ Action cancelled. Back to main menu.", reply_markup=ReplyKeyboardRemove())
+    await send_and_track_message(update, context, text="❌ *Action Cancelled*\n\nReturning to main menu.", reply_markup=ReplyKeyboardRemove())
     
     # Return to main menu
     await show_main_menu(update, context)
@@ -434,7 +428,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_exit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Exits the conversation."""
     user_id = update.effective_user.id
-    await send_and_track_message(update, context, text="Session closed. Use /start to begin again.", reply_markup=ReplyKeyboardRemove())
+    await send_and_track_message(update, context, text="👋 *Session Closed*\n\nThank you for using the Library Bot.\nUse /start to begin a new session.", reply_markup=ReplyKeyboardRemove())
     clear_user_state(user_id)
     SEARCH_CONTEXT.pop(user_id, None)
     USER_PAGINATION_CONTEXT.pop(user_id, None)
@@ -454,7 +448,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ["👥 Bot Users", "👑 Admin Dashboard"],
             ["❌ Exit"]
         ]
-        msg = "👋 *Welcome to the Library Bot*\n_Please select an action below:_"
+        msg = "📚 *Library Bot*\n\n_Please select an option from the menu below._"
     else:
         # Limited menu for public users (not approved yet)
         keyboard = [
@@ -464,9 +458,10 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ["❌ Exit"]
         ]
         msg = (
-            "👋 *Welcome to the Library Bot*\n\n"
-            "📚 You can search books and view library stats.\n\n"
-            "🔒 For student profiles and history, please request access."
+            "📚 *Library Bot*\n\n"
+            "You can search for books and view library statistics.\n\n"
+            "🔒 *Student profiles and reading history require authorization.*\n"
+            "Use the *Request Access* button to apply."
         )
     
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
@@ -481,12 +476,12 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # PUBLIC FEATURES (no authorization required)
     if text == "🔍 Find a Book":
-        msg = await send_and_track_message(update, context, text="🔎 Please enter the *Book Code* or *Name* to search:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
+        msg = await send_and_track_message(update, context, text="🔍 *Search Books*\n\nPlease enter the *Book Code* or *Title* to search:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
         store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, SEARCHING_BOOK)
         
     elif text == "📖 Check Status":
-        msg = await send_and_track_message(update, context, text="📖 Please enter the *Book Code* to check status:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
+        msg = await send_and_track_message(update, context, text="📖 *Check Book Status*\n\nPlease enter the *Book Code* to check its availability:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
         store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, CHECKING_STATUS)
         
@@ -496,14 +491,14 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif text == "🔐 Request Access":
         if is_authorized(user_id):
-            await send_and_track_message(update, context, text="✅ You already have access to all features.")
+            await send_and_track_message(update, context, text="✅ *Access Granted*\n\nYou already have full access to all features.")
             set_user_state(user_id, CHOOSING)
         else:
             await request_admin_approval(update, context)
     
     elif text == "📊 Advanced Analytics":
-        if not await can_access_advanced_analytics(user_id):
-            await send_and_track_message(update, context, text="🔒 *Admin Only*\nThis section is restricted to administrators.")
+        if not is_admin(user_id):
+            await send_and_track_message(update, context, text="🔒 *Access Restricted*\n\nThis section is for administrators only.")
             set_user_state(user_id, CHOOSING)
             return
         
@@ -518,7 +513,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text == "👥 Bot Users":
         if not is_admin(user_id):
-            await send_and_track_message(update, context, text="🔒 *Admin Only*\nThis section is restricted to administrators.")
+            await send_and_track_message(update, context, text="🔒 *Access Restricted*\n\nThis section is for administrators only.")
             set_user_state(user_id, CHOOSING)
             return
         
@@ -527,7 +522,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text == "👑 Admin Dashboard":
         if not is_admin(user_id):
-            await send_and_track_message(update, context, text="🔒 *Admin Only*")
+            await send_and_track_message(update, context, text="🔒 *Access Restricted*\n\nThis section is for administrators only.")
             set_user_state(user_id, CHOOSING)
             return
         await show_admin_dashboard(update, context)
@@ -539,26 +534,26 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "👤 Student Profile":
         if not is_authorized(user_id):
             await send_and_track_message(update, context, text=(
-                "🔒 *Access Restricted*\n\n"
-                "This feature requires admin approval.\n\n"
-                "Please use 🔐 *Request Access* button to get approved."
+                "🔒 *Access Required*\n\n"
+                "This feature requires administrator approval.\n\n"
+                "Please use the *Request Access* button to apply."
             ))
             set_user_state(user_id, CHOOSING)
             return
-        msg = await send_and_track_message(update, context, text="👤 Please enter the *Student ID* or *Name*:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
+        msg = await send_and_track_message(update, context, text="👤 *Student Profile*\n\nPlease enter the *Student ID* or *Name*:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
         store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, STUDENT_DETAILS)
         
     elif text == "🕘 Reading History":
         if not is_authorized(user_id):
             await send_and_track_message(update, context, text=(
-                "🔒 *Access Restricted*\n\n"
-                "This feature requires admin approval.\n\n"
-                "Please use 🔐 *Request Access* button to get approved."
+                "🔒 *Access Required*\n\n"
+                "This feature requires administrator approval.\n\n"
+                "Please use the *Request Access* button to apply."
             ))
             set_user_state(user_id, CHOOSING)
             return
-        msg = await send_and_track_message(update, context, text="🕘 Please enter the *Book Code* to view history:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
+        msg = await send_and_track_message(update, context, text="🕘 *Reading History*\n\nPlease enter the *Book Code* to view its transaction history:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
         store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, ISSUE_HISTORY)
     
@@ -578,7 +573,7 @@ async def show_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="nav_menu")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await send_and_track_message(update, context, text="👑 *Quick Admin Dashboard*\nSelect a management tool:", reply_markup=reply_markup)
+    await send_and_track_message(update, context, text="👑 *Admin Dashboard*\n\nSelect a management tool:", reply_markup=reply_markup)
     set_user_state(user_id, ADMIN_DASHBOARD)
 
 async def show_admin_db_tools(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -593,7 +588,7 @@ async def show_admin_db_tools(update: Update, context: ContextTypes.DEFAULT_TYPE
         [InlineKeyboardButton("🔙 Back to Dashboard", callback_data="admin_dash")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    msg = "🗄 *Database Management*\n\nExport or Import the library database file."
+    msg = "🗄 *Database Management*\n\nExport or import the library database file."
     
     if update.callback_query:
         await update.callback_query.edit_message_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
@@ -632,7 +627,7 @@ async def send_search_page(update: Update, context: ContextTypes.DEFAULT_TYPE, u
             data = response.json()
         
         if data["status"] != "ok":
-            msg = f"Error: {data.get('message', 'Unknown error')}"
+            msg = f"⚠️ *Error*\n\n{data.get('message', 'An unknown error occurred.')}"
             if update.callback_query:
                 await update.callback_query.edit_message_text(msg)
             else:
@@ -644,7 +639,7 @@ async def send_search_page(update: Update, context: ContextTypes.DEFAULT_TYPE, u
         total_count = data["data"]["total_count"]
         
         if not books:
-            msg = "No books found matching that term."
+            msg = "📭 *No Results*\n\nNo books found matching your search term.\nPlease try a different keyword or code."
             if update.callback_query:
                 await update.callback_query.edit_message_text(msg)
             else:
@@ -689,17 +684,15 @@ async def send_search_page(update: Update, context: ContextTypes.DEFAULT_TYPE, u
         else:
             await send_and_track_message(update, context, text=message_text, reply_markup=reply_markup, is_result=True)
             
-            # Send helper prompt for continuous input
-            await send_and_track_message(update, context, text="✅ Done. Enter another book name/code (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
-            
     except Exception as e:
         logger.error(f"Error in send_search_page: {e}")
-        error_msg = "Failed to fetch results. Please try again."
+        error_msg = "⚠️ *Error*\n\nFailed to fetch search results. Please try again."
         if update.callback_query:
             await update.callback_query.edit_message_text(error_msg)
         else:
             await send_and_track_message(update, context, text=error_msg, is_result=True)
-            await send_and_track_message(update, context, text="⚠️ Try again. Enter another book name/code (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
+    
+    set_user_state(user_id, CHOOSING)
 
 async def handle_book_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Processes book status request."""
@@ -715,7 +708,7 @@ async def handle_book_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
             data = response.json()
         
         if data["status"] != "ok":
-            await send_and_track_message(update, context, text="Book code not found.")
+            await send_and_track_message(update, context, text="📭 *Not Found*\n\nNo book found with that code.\nPlease verify the code and try again.")
             return
         
         book = data["data"]
@@ -731,10 +724,10 @@ async def handle_book_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if book["available"] == 0 and "issued_to" in book:
             issued = book["issued_to"]
             msg += (
-                f"\n👤 *Issued To:* {issued['name']} ({issued['batch']or 'N/A'})\n"
+                f"\n👤 *Issued To:* {issued['name']} ({issued['batch'] or 'N/A'})\n"
                 f"📅 *Issue Date:* {issued['issue_date']}\n"
                 f"📅 *Due Date:* {issued['due_date']}\n\n"
-                f"⚠️ _Please ensure timely return._"
+                f"_Please ensure timely return._"
             )
         
         # Inline Navigation
@@ -745,7 +738,7 @@ async def handle_book_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard), is_result=True)
     except Exception as e:
         logger.error(f"Error fetching book status: {e}")
-        await send_and_track_message(update, context, text="Failed to fetch book status. Please try again.", is_result=True)
+        await send_and_track_message(update, context, text="⚠️ *Error*\n\nFailed to fetch book status. Please try again.", is_result=True)
     set_user_state(user_id, CHOOSING)
 
 async def handle_student_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -762,8 +755,9 @@ async def handle_student_details(update: Update, context: ContextTypes.DEFAULT_T
             data = response.json()
         
         if data["status"] != "ok":
-            await send_and_track_message(update, context, text="Student not found.")
-            await send_and_track_message(update, context, text="⚠️ Try again. Enter another Student ID (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
+            await send_and_track_message(update, context, text="📭 *Not Found*\n\nNo student found with that ID or name.\nPlease verify and try again.")
+            await show_main_menu(update, context)
+            set_user_state(user_id, CHOOSING)
             return
         
         student = data["data"]
@@ -817,13 +811,10 @@ async def handle_student_details(update: Update, context: ContextTypes.DEFAULT_T
         ]
         
         await send_and_track_message(update, context, text=msg, photo=photo_bytes, reply_markup=InlineKeyboardMarkup(keyboard), is_result=True)
-        
-        # Send helper prompt for continuous input
-        await send_and_track_message(update, context, text="✅ Done. Enter another Student ID (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
     except Exception as e:
         logger.error(f"Error fetching student details: {e}")
-        await send_and_track_message(update, context, text="Failed to fetch student details. Please try again.")
-        await send_and_track_message(update, context, text="⚠️ Try again. Enter another Student ID (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
+        await send_and_track_message(update, context, text="⚠️ *Error*\n\nFailed to fetch student details. Please try again.")
+    set_user_state(user_id, CHOOSING)
 
 async def handle_issue_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Processes issue history for a book."""
@@ -839,15 +830,13 @@ async def handle_issue_history(update: Update, context: ContextTypes.DEFAULT_TYP
             data = response.json()
         
         if data["status"] != "ok":
-            await send_and_track_message(update, context, text="Failed to fetch history.")
-            await send_and_track_message(update, context, text="⚠️ Try again. Enter another book code (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
+            await send_and_track_message(update, context, text="⚠️ *Error*\n\nFailed to fetch transaction history.")
             return
         
         history = data["data"]["history"]
         
         if not history:
-            await send_and_track_message(update, context, text="No transaction history found for this book code.")
-            await send_and_track_message(update, context, text="✅ Done. Enter another book code (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
+            await send_and_track_message(update, context, text="📭 *No History*\n\nNo transaction history found for this book code.")
         else:
             msg = (
                 f"🕘 *Transaction History*\n\n"
@@ -865,13 +854,10 @@ async def handle_issue_history(update: Update, context: ContextTypes.DEFAULT_TYP
             
             keyboard = [[InlineKeyboardButton("🔙 Main Menu", callback_data="nav_menu")]]
             await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard), is_result=True)
-            
-            # Send helper prompt for continuous input
-            await send_and_track_message(update, context, text="✅ Done. Enter another book code (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
     except Exception as e:
         logger.error(f"Error fetching issue history: {e}")
-        await send_and_track_message(update, context, text="Failed to fetch history. Please try again.")
-        await send_and_track_message(update, context, text="⚠️ Try again. Enter another book code (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
+        await send_and_track_message(update, context, text="⚠️ *Error*\n\nFailed to fetch transaction history. Please try again.")
+    set_user_state(user_id, CHOOSING)
 
 async def handle_book_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Displays aggregate book counts."""
@@ -884,8 +870,7 @@ async def handle_book_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data = response.json()
         
         if data["status"] != "ok":
-            await send_and_track_message(update, context, text="Error fetching book counts.")
-            await send_and_track_message(update, context, text="⚠️ Try again. Enter another book code (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
+            await send_and_track_message(update, context, text="⚠️ *Error*\n\nFailed to fetch library statistics.")
             return
         
         stats = data["data"]
@@ -897,13 +882,9 @@ async def handle_book_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"_Last updated: {stats['timestamp']}_"
         )
         await send_and_track_message(update, context, text=msg, is_result=True)
-        
-        # Send helper prompt for continuous input
-        await send_and_track_message(update, context, text="✅ Done. Enter another book code (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
     except Exception as e:
         logger.error(f"Error fetching library stats: {e}")
-        await send_and_track_message(update, context, text="Failed to fetch library stats. Please try again.")
-        await send_and_track_message(update, context, text="⚠️ Try again. Enter another book code (or tap 🏠 Main Menu).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]), delay=45)
+        await send_and_track_message(update, context, text="⚠️ *Error*\n\nFailed to fetch library statistics. Please try again.")
         
     # If called from menu (update.message present), show menu again
     if update.message:
@@ -934,18 +915,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Admin approved user {target_id}")
             await log_admin_action(user_id, "Approve User", target_id)
             
-            # Update user role in database
-            try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    await client.post(f"{API_BASE}/update_user_role", json={
-                        "chat_id": target_id,
-                        "role": "Approved",
-                        "admin_id": user_id
-                    })
-                logger.info(f"Updated user {target_id} role to Approved in database")
-            except Exception as e:
-                logger.error(f"Failed to update user role in database: {e}")
-            
             # Update Admin Message
             try:
                 if query.message.caption:
@@ -966,12 +935,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     chat_id=target_id,
                     text=(
-                        "✅ *Your access has been approved.*\n\n"
-                        "You can now use all features including:\n"
+                        "✅ *Access Approved*\n\n"
+                        "Your access request has been approved by the administrator.\n\n"
+                        "You now have access to:\n"
                         "• 👤 Student Profile\n"
-                        "• 🕘 Reading History\n"
-                        "• 📊 Advanced Analytics\n\n"
-                        "Use /start to see the updated menu."
+                        "• 🕘 Reading History\n\n"
+                        "Use /start to view the updated menu."
                     ),
                     parse_mode='Markdown'
                 )
@@ -1005,8 +974,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     chat_id=target_id,
                     text=(
-                        "❌ *Your access request was declined.*\n\n"
-                        "Contact library admin for more information."
+                        "❌ *Access Denied*\n\n"
+                        "Your access request has been declined.\n"
+                        "Please contact the library administrator for more information."
                     ),
                     parse_mode='Markdown'
                 )
@@ -1031,12 +1001,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "admin_logs":
             await show_admin_logs(update, context, "ERROR", 1)
         elif data == "admin_user_history":
-            await send_and_track_message(update, context, text="👤 Please enter the *User ID* to view history:", reply_markup=ReplyKeyboardRemove())
+            await send_and_track_message(update, context, text="👤 *User History*\n\nPlease enter the *User ID* to view their activity:", reply_markup=ReplyKeyboardRemove())
             set_user_state(user_id, ADMIN_USER_HISTORY)
         elif data == "admin_audit":
             await show_admin_audit(update, context, "all", 1)
         elif data == "admin_reset":
-            await send_and_track_message(update, context, text="🔄 Please enter the *User ID* to reset their session:", reply_markup=ReplyKeyboardRemove())
+            await send_and_track_message(update, context, text="🔄 *Reset User Session*\n\nPlease enter the *User ID* to reset:", reply_markup=ReplyKeyboardRemove())
             set_user_state(user_id, ADMIN_RESET_USER)
         elif data == "admin_dash":
             await show_admin_dashboard(update, context)
@@ -1080,7 +1050,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 3. Analytics Actions
     if data.startswith("ana_"):
-        if not await can_access_advanced_analytics(user_id):
+        if not is_admin(user_id):
             await query.answer("🔒 Admin only", show_alert=True)
             return
             
@@ -1092,7 +1062,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("⏰ Overdue List", callback_data="ana_overdue")],
                 [InlineKeyboardButton("🔙 Main Menu", callback_data="nav_menu")]
             ]
-            await query.message.edit_text("📊 *Advanced Analytics*\nSelect a report to view:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            await query.message.edit_text("📊 *Advanced Analytics*\n\nSelect a report to view:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
             return
 
         if data == "ana_prev":
@@ -1132,31 +1102,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_search_page(update, context, user_id, SEARCH_CONTEXT[user_id]["page"])
             
     elif data == "nav_search":
-        msg = await send_and_track_message(update, context, text="🔎 Please enter *Book Code* or *Name*:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
+        msg = await send_and_track_message(update, context, text="🔍 *Search Books*\n\nPlease enter *Book Code* or *Title*:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
         store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, SEARCHING_BOOK)
         
     elif data == "nav_status":
-        msg = await send_and_track_message(update, context, text="📖 Enter *Book Code*:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
+        msg = await send_and_track_message(update, context, text="📖 *Check Status*\n\nPlease enter the *Book Code*:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
         store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, CHECKING_STATUS)
         
     elif data == "nav_student":
         # Check auth again just in case
         if not is_authorized(user_id):
-            await send_and_track_message(update, context, text="🚫 details restricted.")
+            await send_and_track_message(update, context, text="🔒 *Access Required*\n\nStudent details require authorization.\nPlease request access first.")
             set_user_state(user_id, CHOOSING)
             return
-        msg = await send_and_track_message(update, context, text="👤 Enter *Student ID* or *Name*:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
+        msg = await send_and_track_message(update, context, text="👤 *Student Profile*\n\nPlease enter *Student ID* or *Name*:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
         store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, STUDENT_DETAILS)
         
     elif data == "nav_history":
         if not is_authorized(user_id):
-            await send_and_track_message(update, context, text="🚫 history restricted.")
+            await send_and_track_message(update, context, text="🔒 *Access Required*\n\nIssue history requires authorization.\nPlease request access first.")
             set_user_state(user_id, CHOOSING)
             return
-        msg = await send_and_track_message(update, context, text="🕘 Enter *Book Code*:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
+        msg = await send_and_track_message(update, context, text="🕘 *Reading History*\n\nPlease enter the *Book Code*:", reply_markup=ReplyKeyboardRemove(), delay=PROMPT_TTL_SECONDS)
         store_prompt(user_id, msg.message_id if msg else None)
         set_user_state(user_id, ISSUE_HISTORY)
 
@@ -1241,13 +1211,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 target_id = int(update.message.text.strip())
                 await show_user_history(update, context, target_id, 1)
             except ValueError:
-                await send_and_track_message(update, context, text="❌ Invalid User ID.")
+                await send_and_track_message(update, context, text="❌ *Invalid Input*\n\nPlease enter a valid numeric User ID.")
                 await show_admin_dashboard(update, context)
         elif current_state == ADMIN_DB_UPLOAD:
             if update.message.document:
                 await handle_db_file_upload(update, context)
             else:
-                await send_and_track_message(update, context, text="⚠️ Please upload a `.db` file as a document.")
+                await send_and_track_message(update, context, text="⚠️ *Invalid File*\n\nPlease upload a `.db` file as a document.")
         else:
             # Unknown state, reset to CHOOSING
             logger.warning(f"Unknown state {current_state} for user {user_id}, resetting to CHOOSING")
@@ -1255,7 +1225,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_main_menu(update, context)
     except Exception as e:
         logger.error(f"Error in handle_message for user {user_id}: {e}", exc_info=True)
-        await send_and_track_message(update, context, text="Sorry, an error occurred. Please try again.")
+        await send_and_track_message(update, context, text="⚠️ *Error*\n\nAn unexpected error occurred. Please try again.")
         set_user_state(user_id, CHOOSING)
 
 # --- RUNTIME GUARD ---
@@ -1281,13 +1251,13 @@ async def send_bot_users_page(update: Update, context: ContextTypes.DEFAULT_TYPE
             res_data = response.json()
             
         if res_data["status"] != "ok":
-            await send_and_track_message(update, context, text="❌ Error fetching users.")
+            await send_and_track_message(update, context, text="⚠️ *Error*\n\nFailed to fetch bot users.")
             return
 
         users = res_data["data"]["users"]
         total_pages = res_data["data"]["total_pages"]
         
-        msg = f"👥 *Bot Users* (Page {page}/{total_pages})\n\n"
+        msg = f"👥 *Registered Users*\n\nPage {page} of {total_pages}\n\n"
         keyboard = []
         
         for u in users:
@@ -1312,7 +1282,7 @@ async def send_bot_users_page(update: Update, context: ContextTypes.DEFAULT_TYPE
             
     except Exception as e:
         logger.error(f"Error in send_bot_users_page: {e}")
-        await send_and_track_message(update, context, text="❌ Failed to load users.")
+        await send_and_track_message(update, context, text="⚠️ *Error*\n\nFailed to load bot users.")
 
 async def show_user_details(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int):
     """Shows full details and management actions for a user."""
@@ -1329,7 +1299,7 @@ async def show_user_details(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         msg = (
             f"👤 *User Details*\n\n"
             f"📛 *Name:* {u['name']}\n"
-            f"🔖 *Username:* @{u['username'] if u['username'] else 'None'}\n"
+            f"🔖 *Username:* @{u['username'] if u['username'] else 'N/A'}\n"
             f"🆔 *Chat ID:* `{u['chat_id']}`\n"
             f"🎭 *Role:* {u['role']}\n"
             f"📅 *Joined:* {u['joined_at']}\n"
@@ -1354,7 +1324,7 @@ async def confirm_action(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
         [InlineKeyboardButton("✅ Yes, Confirm", callback_data=callback_data)],
         [InlineKeyboardButton("❌ Cancel", callback_data="page_user_back")]
     ]
-    await update.callback_query.edit_message_text(f"⚠️ *Confirmation*\n\n{text}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    await update.callback_query.edit_message_text(f"⚠️ *Confirm Action*\n\n{text}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 async def show_role_options(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int):
     keyboard = [
@@ -1364,7 +1334,7 @@ async def show_role_options(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         [InlineKeyboardButton("Blocked", callback_data=f"setrole_Blocked_{target_id}")],
         [InlineKeyboardButton("🔙 Cancel", callback_data=f"view_user_{target_id}")]
     ]
-    await update.callback_query.edit_message_text("🎭 *Select New Role*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    await update.callback_query.edit_message_text("🎭 *Select New Role*\n\nChoose a role for this user:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 async def update_user_role_api(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int, role: str):
     try:
@@ -1404,10 +1374,10 @@ async def show_admin_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_status = "✅ Present" if data["database_present"] else "❌ Missing"
         
         msg = (
-            f"🧠 *System Health Dashboard*\n\n"
+            f"🧠 *System Health*\n\n"
             f"🤖 *Bot Status:* Running\n"
-            f"⚙️ *Backend Status:* {status}\n"
-            f"📁 *Database File:* {db_status}\n"
+            f"⚙️ *Backend:* {status}\n"
+            f"📁 *Database:* {db_status}\n"
             f"🕒 *Timestamp:* {data['timestamp']}\n"
             f"🔌 *Port:* {data['port']}\n"
         )
@@ -1423,7 +1393,7 @@ async def show_admin_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
         logger.error(f"Error in show_admin_health: {e}")
-        await send_and_track_message(update, context, text="❌ Failed to fetch health status.")
+        await send_and_track_message(update, context, text="⚠️ *Error*\n\nFailed to fetch system health status.")
 
 async def show_admin_logs(update: Update, context: ContextTypes.DEFAULT_TYPE, level: str, page: int):
     """Shows in-memory logs with pagination."""
@@ -1436,9 +1406,9 @@ async def show_admin_logs(update: Update, context: ContextTypes.DEFAULT_TYPE, le
     end_idx = start_idx + page_size
     page_logs = logs[start_idx:end_idx]
     
-    msg = f"📜 *System Logs* ({level})\nPage {page}/{total_pages}\n\n"
+    msg = f"📜 *System Logs*\n\nFilter: {level} — Page {page}/{total_pages}\n\n"
     if not page_logs:
-        msg += "_No logs found._"
+        msg += "_No logs found for this filter._"
     else:
         for l in page_logs:
             msg += f"🕒 `{l['timestamp']}`\n`{l['level']}`: {l['message'][:100]}\n\n"
@@ -1471,14 +1441,14 @@ async def show_admin_audit(update: Update, context: ContextTypes.DEFAULT_TYPE, f
             res_data = response.json()
             
         if res_data["status"] != "ok":
-            await send_and_track_message(update, context, text="❌ Error fetching audit log.")
+            await send_and_track_message(update, context, text="⚠️ *Error*\n\nFailed to fetch audit log.")
             return
 
         actions = res_data["data"]
-        msg = f"🛡 *Admin Audit Log* ({filter_type.capitalize()})\n\n"
+        msg = f"🛡 *Admin Audit Log*\n\nFilter: {filter_type.capitalize()}\n\n"
         
         if not actions:
-            msg += "_No actions recorded._"
+            msg += "_No actions recorded for this filter._"
         else:
             for a in actions:
                 target = f" (User: `{a['target_user_id']}`)" if a['target_user_id'] else ""
@@ -1506,7 +1476,7 @@ async def show_admin_audit(update: Update, context: ContextTypes.DEFAULT_TYPE, f
             await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
         logger.error(f"Error in show_admin_audit: {e}")
-        await send_and_track_message(update, context, text="❌ Failed to load audit log.")
+        await send_and_track_message(update, context, text="⚠️ *Error*\n\nFailed to load audit log.")
 
 async def show_user_history(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int, page: int = 1):
     """Shows action history for a specific user."""
@@ -1516,11 +1486,11 @@ async def show_user_history(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             res_data = response.json()
             
         if res_data["status"] != "ok":
-            await send_and_track_message(update, context, text="❌ Error fetching user history.")
+            await send_and_track_message(update, context, text="⚠️ *Error*\n\nFailed to fetch user action history.")
             return
 
         actions = res_data["data"]
-        msg = f"� *User Action History* (`{target_id}`)\n\n"
+        msg = f"📜 *User Action History*\n\n👤 User: `{target_id}`\n\n"
         
         if not actions:
             msg += "_No actions found for this user._"
@@ -1542,7 +1512,7 @@ async def show_user_history(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
         logger.error(f"Error in show_user_history: {e}")
-        await send_and_track_message(update, context, text="❌ Failed to load user history.")
+        await send_and_track_message(update, context, text="⚠️ *Error*\n\nFailed to load user action history.")
 
 async def handle_admin_reset_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Resets a user's session and state."""
@@ -1566,7 +1536,7 @@ async def handle_admin_reset_user(update: Update, context: ContextTypes.DEFAULT_
         try:
             await context.bot.send_message(
                 chat_id=target_id,
-                text="🔄 *Session Reset*\nYour session has been reset by an administrator. Please use /start to begin again.",
+                text="🔄 *Session Reset*\n\nYour session has been reset by an administrator.\nPlease use /start to begin a new session.",
                 parse_mode='Markdown'
             )
         except Exception:
@@ -1575,14 +1545,14 @@ async def handle_admin_reset_user(update: Update, context: ContextTypes.DEFAULT_
         # 4. Log Action
         await log_admin_action(admin_id, "Reset User Session", target_id, "Cleared state and cancelled tasks.")
         
-        await send_and_track_message(update, context, text=f"✅ *User {target_id} Reset*\nSession cleared and user notified.")
+        await send_and_track_message(update, context, text=f"✅ *User Reset*\n\nUser `{target_id}` has been reset successfully.")
         await show_admin_dashboard(update, context)
         
     except ValueError:
-        await send_and_track_message(update, context, text="❌ Invalid User ID. Please enter a numeric ID.")
+        await send_and_track_message(update, context, text="❌ *Invalid Input*\n\nPlease enter a valid numeric User ID.")
     except Exception as e:
         logger.error(f"Error in handle_admin_reset_user: {e}")
-        await send_and_track_message(update, context, text="❌ Failed to reset user.")
+        await send_and_track_message(update, context, text="⚠️ *Error*\n\nFailed to reset user session.")
 
 async def handle_db_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Exports the database file to the admin."""
@@ -1591,7 +1561,7 @@ async def handle_db_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not os.path.exists(DB_PATH):
-        await send_and_track_message(update, context, text="❌ Database file not found.")
+        await send_and_track_message(update, context, text="⚠️ *Error*\n\nDatabase file not found.")
         return
 
     try:
@@ -1601,12 +1571,12 @@ async def handle_db_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=user_id,
                 document=f,
                 filename=f"library_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db",
-                caption="✅ *Database Exported Successfully*"
+                caption="✅ *Database Exported Successfully*\n\nYour backup has been generated."
             )
         await log_admin_action(user_id, "DB_EXPORT", details=f"File: {DB_PATH}")
     except Exception as e:
         logger.error(f"Error exporting database: {e}")
-        await send_and_track_message(update, context, text="❌ Failed to export database.")
+        await send_and_track_message(update, context, text="⚠️ *Error*\n\nFailed to export database.")
 
 async def handle_db_import_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Asks for confirmation before database import."""
@@ -1620,9 +1590,9 @@ async def handle_db_import_confirm(update: Update, context: ContextTypes.DEFAULT
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     msg = (
-        "⚠️ *WARNING: Database Import*\n\n"
-        "Uploading a new database will *REPLACE* all current data.\n"
-        "This action is irreversible (though a backup will be created).\n\n"
+        "⚠️ *Database Import*\n\n"
+        "Uploading a new database will *replace* all current data.\n"
+        "This action is irreversible (a backup will be created automatically).\n\n"
         "Do you want to continue?"
     )
     await update.callback_query.edit_message_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
@@ -1635,11 +1605,11 @@ async def handle_db_file_upload(update: Update, context: ContextTypes.DEFAULT_TY
 
     doc = update.message.document
     if not doc.file_name.endswith('.db'):
-        await send_and_track_message(update, context, text="❌ Invalid file type. Please upload a `.db` file.")
+        await send_and_track_message(update, context, text="⚠️ *Invalid File*\n\nPlease upload a `.db` file.")
         return
 
     if doc.file_size > 50 * 1024 * 1024: # 50MB limit
-        await send_and_track_message(update, context, text="❌ File too large. Maximum size is 50MB.")
+        await send_and_track_message(update, context, text="⚠️ *File Too Large*\n\nMaximum file size is 50MB.")
         return
 
     temp_path = "temp_import.db"
@@ -1662,7 +1632,7 @@ async def handle_db_file_upload(update: Update, context: ContextTypes.DEFAULT_TY
         if not required_tables.issubset(existing_tables):
             missing = required_tables - existing_tables
             os.remove(temp_path)
-            await send_and_track_message(update, context, text=f"❌ Invalid database schema. Missing tables: {', '.join(missing)}")
+            await send_and_track_message(update, context, text=f"⚠️ *Invalid Schema*\n\nThe database is missing required tables: {', '.join(missing)}")
             return
 
         # 3. Atomic Replace with Backup
@@ -1671,7 +1641,7 @@ async def handle_db_file_upload(update: Update, context: ContextTypes.DEFAULT_TY
         
         try:
             shutil.move(temp_path, DB_PATH)
-            await send_and_track_message(update, context, text="✅ *Database Replaced Successfully*\nThe library data has been updated.")
+            await send_and_track_message(update, context, text="✅ *Import Complete*\n\nDatabase has been replaced successfully.\nLibrary data has been updated.")
             await log_admin_action(user_id, "DB_IMPORT", details=f"File: {doc.file_name}, Size: {doc.file_size}")
             set_user_state(user_id, CHOOSING)
         except Exception as e:
@@ -1684,7 +1654,7 @@ async def handle_db_file_upload(update: Update, context: ContextTypes.DEFAULT_TY
         logger.error(f"Error importing database: {e}")
         if os.path.exists(temp_path):
             os.remove(temp_path)
-        await send_and_track_message(update, context, text="❌ Failed to import database. Rollback performed if possible.")
+        await send_and_track_message(update, context, text="⚠️ *Import Failed*\n\nFailed to import database. Rollback performed if possible.")
 
 async def send_analytics_page(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
     """Fetches and displays a specific page of analytics."""
@@ -1696,7 +1666,7 @@ async def send_analytics_page(update: Update, context: ContextTypes.DEFAULT_TYPE
     page = context_data["page"]
     
     query = update.callback_query
-    await query.message.edit_text("⏳ _Generating report..._", parse_mode='Markdown')
+    await query.message.edit_text("⏳ _Generating report, please wait..._", parse_mode='Markdown')
 
     try:
         endpoint = {
@@ -1713,7 +1683,7 @@ async def send_analytics_page(update: Update, context: ContextTypes.DEFAULT_TYPE
             res_data = response.json()
         
         if res_data["status"] != "ok":
-            await query.message.edit_text(f"❌ Error: {res_data.get('message', 'Unknown error')}")
+            await query.message.edit_text(f"⚠️ *Error*\n\n{res_data.get('message', 'An unknown error occurred.')}")
             return
 
         result_data = res_data["data"]
@@ -1722,7 +1692,7 @@ async def send_analytics_page(update: Update, context: ContextTypes.DEFAULT_TYPE
         total_count = result_data["total_count"]
 
         if not items:
-            msg = "📊 *Analytics Report*\n\nNo data found for this category."
+            msg = "📊 *Analytics Report*\n\nNo data available for this category."
         else:
             if ana_type == "ana_most":
                 msg = f"🔥 *Most Issued Books*\nTotal: {total_count} | Page: {page}/{total_pages}\n\n"
@@ -1754,7 +1724,7 @@ async def send_analytics_page(update: Update, context: ContextTypes.DEFAULT_TYPE
         
     except Exception as e:
         logger.error(f"Analytics error: {e}")
-        await query.message.edit_text("❌ Failed to generate report. Please try again.")
+        await query.message.edit_text("⚠️ *Error*\n\nFailed to generate report. Please try again.")
 
 if __name__ == '__main__':
     if not BOT_RUNNING:
@@ -1768,4 +1738,3 @@ if __name__ == '__main__':
         app_instance.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
     else:
         logger.warning("Bot is already running. Skipping duplicate startup.")
-

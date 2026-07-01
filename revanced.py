@@ -186,47 +186,21 @@ def get_teacher_chat_id(batch: str) -> int:
     return BATCH_TEACHERS.get(batch, 0)
 #SANITISE
 
+# ------------------ WhatsApp Setup ------------------ #
+# ------------------ WhatsApp Setup ------------------ #
 from typing import Optional
 
+# ------------------ WhatsApp Setup ------------------ #
 
 def send_telegram_message(chat_id: int, text: str, image_path: Optional[str] = None):
-    """Wrapper function using shared telegram_utils module."""
+    """
+    Wrapper function for backward compatibility.
+    Uses shared telegram_utils module.
+    """
     if image_path and os.path.exists(image_path):
         return send_photo(chat_id, image_path, text)
     else:
         return send_message(chat_id, text)
-
-    if not chat_id:
-        print("⚠️ Telegram chat_id not configured")
-        return False
-
-    try:
-        if image_path and os.path.exists(image_path):
-            url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
-            with open(image_path, "rb") as f:
-                files = {"photo": f}
-                data = {
-                    "chat_id": chat_id,
-                    "caption": text,
-                    "parse_mode": "HTML",
-                }
-                resp = requests.post(url, data=data, files=files, timeout=30)
-        else:
-            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-            data = {
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "HTML",
-            }
-            resp = requests.post(url, data=data, timeout=30)
-
-        if resp.status_code != 200:
-            print("⚠️ Telegram send error:", resp.text)
-            return False
-        return True
-    except Exception as e:
-        print("⚠️ Telegram send error:", e)
-        return False
 
 
 
@@ -1053,7 +1027,7 @@ class IslamicLibraryApp(ctk.CTk):
             f"📅 *Due Date:* {formatted_due}\n\n"
             "_Please ensure timely return._"
         )
-
+    
     def _format_return_caption(self, student_name, batch, book_title, rating=None):
         return_date = datetime.now().strftime('%d-%b-%Y')
         msg = (
@@ -1597,7 +1571,7 @@ class IslamicLibraryApp(ctk.CTk):
     
         footer_text = ctk.CTkLabel(
             self.footer_frame,
-            text="Markhins Central Library — Powered by Antigravity Intelligence | v1.5.0",
+            text="Markhins Central Library — Powered by 12th batch v1.5.0",
             text_color=self.light_text,
             font=self.font_11
         )

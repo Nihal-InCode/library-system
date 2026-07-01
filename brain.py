@@ -568,27 +568,6 @@ def get_user_details():
         logger.error(f"Error in get_user_details: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-@app.route('/get_user_role', methods=['POST'])
-def get_user_role():
-    """Get a user's role."""
-    try:
-        data = request.get_json()
-        chat_id = data.get('chat_id')
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT role FROM bot_users WHERE chat_id = ?", (chat_id,))
-        result = cursor.fetchone()
-        conn.close()
-        
-        if result:
-            return jsonify({"status": "ok", "role": result[0]})
-        else:
-            return jsonify({"status": "error", "message": "User not found"})
-    except Exception as e:
-        logger.error(f"Error in get_user_role: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
 @app.route('/update_user_role', methods=['POST'])
 def update_user_role():
     """Update a user's role."""
