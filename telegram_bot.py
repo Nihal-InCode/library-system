@@ -500,7 +500,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ["👥 Bot Users", "👑 Admin Dashboard"],
             ["❌ Exit"]
         ]
-        msg = "📚 *Library Bot*\n\n_Please select an option from the menu below._"
+        msg = "📚 *MCL BOT*\n\n_Please select an option from the menu below._"
     else:
         # Limited menu for public users (not approved yet)
         keyboard = [
@@ -510,7 +510,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ["❌ Exit"]
         ]
         msg = (
-            "📚 *Library Bot*\n\n"
+            "📚 *MCL BOT*\n\n"
             "You can search for books and view library statistics.\n\n"
             "🔒 *Student profiles and reading history require authorization.*\n"
             "Use the *Request Access* button to apply."
@@ -931,7 +931,7 @@ async def handle_book_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stats = data["data"]
         msg = (
             f"📊 *Library Statistics*\n\n"
-            f"📚 *Total Unique Books:* {stats['total_books']}\n"
+            f"📚 *Total Books:* {stats['total_books']}\n"
             f"✅ *Available Copies:* {stats['available_copies']}\n"
             f"📖 *Currently Issued:* {stats['issued_books']}\n\n"
             f"_Last updated: {stats['timestamp']}_"
