@@ -483,7 +483,12 @@ async def request_admin_approval(update: Update, context: ContextTypes.DEFAULT_T
     last_name = user.last_name or ""
     full_name = f"{first_name} {last_name}".strip()
     username = f"@{user.username}" if user.username else "Not set"
-    
+
+    # Escape Markdown special characters in user data
+    for ch in ('_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'):
+        full_name = full_name.replace(ch, f'\\{ch}')
+        username = username.replace(ch, f'\\{ch}')
+
     msg = (
         f"🔐 *New Access Request*\n\n"
         f"👤 *Name:* {full_name}\n"
@@ -502,16 +507,22 @@ async def request_admin_approval(update: Update, context: ContextTypes.DEFAULT_T
     
     try:
         # Try to send profile photo if available
-        photos = await user.get_profile_photos(limit=1)
-        if photos.total_count > 0:
+        photo_file_id = None
+        try:
+            photos = await user.get_profile_photos(limit=1)
+            if photos.total_count > 0:
+                photo_file_id = photos.photos[0][0].file_id
+        except Exception:
+            pass  # Photo fetch failed, continue without photo
+
+        if photo_file_id:
             await context.bot.send_photo(
                 chat_id=ADMIN_CHAT_ID,
-                photo=photos.photos[0][0].file_id,
+                photo=photo_file_id,
                 caption=msg,
                 parse_mode='Markdown',
                 reply_markup=markup
             )
-            logger.info(f"Access request sent to admin for user {user_id} (with photo)")
         else:
             await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
@@ -519,7 +530,6 @@ async def request_admin_approval(update: Update, context: ContextTypes.DEFAULT_T
                 parse_mode='Markdown',
                 reply_markup=markup
             )
-            logger.info(f"Access request sent to admin for user {user_id} (no photo)")
     except Exception as e:
         logger.error(f"Failed to send admin request for user {user_id}: {e}")
         await send_and_track_message(update, context, text="⚠️ *Request Failed*\n\nUnable to send your request. Please try again later.")
