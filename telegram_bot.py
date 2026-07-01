@@ -93,8 +93,6 @@ ISSUE_HISTORY = "ISSUE_HISTORY"
 ADMIN_DASHBOARD = "ADMIN_DASHBOARD"
 ADMIN_RESET_USER = "ADMIN_RESET_USER"
 ADMIN_USER_HISTORY = "ADMIN_USER_HISTORY"
-ADMIN_DB_TOOLS = "ADMIN_DB_TOOLS"
-ADMIN_DB_UPLOAD = "ADMIN_DB_UPLOAD"
 
 # --- STATE HELPERS ---
 def get_user_state(user_id: int) -> str:
@@ -638,11 +636,14 @@ async def show_admin_db_tools(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     keyboard = [
         [InlineKeyboardButton("⬇️ Download Database", callback_data="admin_export")],
-        [InlineKeyboardButton("⬆️ Upload Database", callback_data="admin_import")],
         [InlineKeyboardButton("🔙 Back to Dashboard", callback_data="admin_dash")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    msg = "🗄 *Database Management*\n\nExport or import the library database file."
+    msg = (
+        "🗄 *Database Management*\n\n"
+        "⬇️ *Download* — Export the current database.\n"
+        "📤 *Upload* — Just send a `.db` file directly and it auto-imports!"
+    )
     
     if update.callback_query:
         await update.callback_query.edit_message_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
@@ -1068,11 +1069,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_admin_db_tools(update, context)
         elif data == "admin_export":
             await handle_db_export(update, context)
-        elif data == "admin_import":
-            await handle_db_import_confirm(update, context)
-        elif data == "admin_import_confirm":
-            await send_and_track_message(update, context, text="⬆️ *Upload Database*\n\nPlease upload the `.db` file as a document.", reply_markup=ReplyKeyboardRemove())
-            set_user_state(user_id, ADMIN_DB_UPLOAD)
         return
 
     # 6. Admin Log Navigation
@@ -1233,7 +1229,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
     await upsert_bot_user(user)
-    
+
+    # --- AUTO DB IMPORT: If admin sends a .db file, import it instantly ---
+    if update.message.document and is_admin(user_id):
+        doc = update.message.document
+        if doc.file_name.endswith('.db'):
+            await handle_db_file_upload(update, context)
+            return
+
     current_state = get_user_state(user_id)
     
     msg_text = update.message.text or ""
@@ -1267,11 +1270,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except ValueError:
                 await send_and_track_message(update, context, text="❌ *Invalid Input*\n\nPlease enter a valid numeric User ID.")
                 await show_admin_dashboard(update, context)
-        elif current_state == ADMIN_DB_UPLOAD:
-            if update.message.document:
-                await handle_db_file_upload(update, context)
-            else:
-                await send_and_track_message(update, context, text="⚠️ *Invalid File*\n\nPlease upload a `.db` file as a document.")
         else:
             # Unknown state, reset to CHOOSING
             logger.warning(f"Unknown state {current_state} for user {user_id}, resetting to CHOOSING")
@@ -1632,27 +1630,8 @@ async def handle_db_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error exporting database: {e}")
         await send_and_track_message(update, context, text="⚠️ *Error*\n\nFailed to export database.")
 
-async def handle_db_import_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Asks for confirmation before database import."""
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        return
-
-    keyboard = [
-        [InlineKeyboardButton("✅ Continue", callback_data="admin_import_confirm")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="admin_db")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    msg = (
-        "⚠️ *Database Import*\n\n"
-        "Uploading a new database will *replace* all current data.\n"
-        "This action is irreversible (a backup will be created automatically).\n\n"
-        "Do you want to continue?"
-    )
-    await update.callback_query.edit_message_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
-
 async def handle_db_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes the uploaded database file."""
+    """Processes the uploaded database file. Admin-only, auto-imports instantly."""
     user_id = update.effective_user.id
     if not is_admin(user_id):
         return
