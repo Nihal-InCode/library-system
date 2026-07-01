@@ -537,9 +537,8 @@ async def request_admin_approval(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     await send_and_track_message(update, context, text=(
-        "✅ *Request Sent*\n\n"
-        "Your access request has been submitted successfully.\n"
-        "The administrator will review it and notify you of the decision."
+        "✅ *Request Submitted*\n\n"
+        "Waiting for admin approval......."
     ))
     set_user_state(user_id, CHOOSING)
 
@@ -653,8 +652,8 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await request_admin_approval(update, context)
     
     elif text == "📊 Advanced Analytics":
-        if not is_admin(user_id):
-            await send_and_track_message(update, context, text="🔒 *Access Restricted*\n\nThis section is for administrators only.")
+        if not is_authorized(user_id):
+            await send_and_track_message(update, context, text="🔒 *Access Restricted*\n\nThis section requires authorization.\nPlease use the *Request Access* button to apply.")
             set_user_state(user_id, CHOOSING)
             return
         
