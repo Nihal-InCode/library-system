@@ -26,10 +26,37 @@ from telegram_utils import get_bot_token, get_admin_chat_id
 # --- CONFIGURATION ---
 TOKEN = get_bot_token()
 ADMIN_CHAT_ID = get_admin_chat_id()
-APPROVED_USERS: Set[int] = {ADMIN_CHAT_ID}  # Admin is always approved
 PORT = int(os.environ.get("PORT", "8080"))
 API_BASE = os.environ.get("API_BASE", f"http://127.0.0.1:{PORT}")
 DB_PATH = "islamic_library.db"
+APPROVED_USERS_FILE = "approved_users.txt"
+
+# --- PERSISTED APPROVALS (file-based, survives DB replacements) ---
+def _load_approved_users() -> Set[int]:
+    """Load approved user IDs from file."""
+    users = set()
+    try:
+        if os.path.exists(APPROVED_USERS_FILE):
+            with open(APPROVED_USERS_FILE, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and line.isdigit():
+                        users.add(int(line))
+    except Exception:
+        pass
+    return users
+
+def _save_approved_users():
+    """Save approved user IDs to file."""
+    try:
+        with open(APPROVED_USERS_FILE, "w") as f:
+            for uid in APPROVED_USERS:
+                f.write(f"{uid}\n")
+    except Exception as e:
+        logger.error(f"Failed to save approved users: {e}")
+
+APPROVED_USERS: Set[int] = {ADMIN_CHAT_ID}  # Admin is always approved
+APPROVED_USERS.update(_load_approved_users())  # Load persisted approvals
 
 # --- LOGGING ---
 class InMemoryLogHandler(logging.Handler):
@@ -324,17 +351,14 @@ async def send_and_track_message(update: Update, context: ContextTypes.DEFAULT_T
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_CHAT_ID
 
-def _check_db_auth(user_id: int) -> bool:
-    """Check if user is authorized via database role."""
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=5)
-        cursor = conn.cursor()
-        cursor.execute("SELECT role FROM bot_users WHERE chat_id = ?", (user_id,))
-        row = cursor.fetchone()
-        conn.close()
-        return row is not None and row[0] in ("Approved", "Admin")
-    except Exception:
-        return False
+def is_authorized(user_id: int) -> bool:
+    if is_admin(user_id):
+        return True
+    if user_id in APPROVED_USERS:
+        return True
+    # Reload from file (in case of restart)
+    APPROVED_USERS.update(_load_approved_users())
+    return user_id in APPROVED_USERS
 
 def is_authorized(user_id: int) -> bool:
     if is_admin(user_id):
@@ -987,21 +1011,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             
             APPROVED_USERS.add(target_id)
-            
-            # Persist approval to database (survives restarts)
-            try:
-                conn = sqlite3.connect(DB_PATH, timeout=5)
-                cursor = conn.cursor()
-                cursor.execute(
-                    "INSERT INTO bot_users (chat_id, role, approved_by) VALUES (?, 'Approved', ?) "
-                    "ON CONFLICT(chat_id) DO UPDATE SET role = 'Approved', approved_by = ?",
-                    (target_id, user_id, user_id)
-                )
-                conn.commit()
-                conn.close()
-            except Exception as e:
-                logger.error(f"Failed to persist approval to DB: {e}")
-            
+            _save_approved_users()
             logger.info(f"Admin approved user {target_id}")
             await log_admin_action(user_id, "Approve User", target_id)
             
@@ -1044,19 +1054,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Admin declined user {target_id}")
             await log_admin_action(user_id, "Decline User", target_id)
             
-            # Persist decline to database
-            try:
-                conn = sqlite3.connect(DB_PATH, timeout=5)
-                cursor = conn.cursor()
-                cursor.execute(
-                    "INSERT INTO bot_users (chat_id, role) VALUES (?, 'Blocked') "
-                    "ON CONFLICT(chat_id) DO UPDATE SET role = 'Blocked'",
-                    (target_id,)
-                )
-                conn.commit()
-                conn.close()
-            except Exception as e:
-                logger.error(f"Failed to persist decline to DB: {e}")
+            # Remove from approved users
+            APPROVED_USERS.discard(target_id)
+            _save_approved_users()
             
             # Update Admin Message
             try:
@@ -1449,11 +1449,12 @@ async def update_user_role_api(update: Update, context: ContextTypes.DEFAULT_TYP
         if res_data["status"] == "ok":
             await update.callback_query.answer(f"✅ Role updated to {role}")
             await log_admin_action(admin_id, "Change Role", target_id, f"New role: {role}")
-            # If approved, update the in-memory set for immediate effect
+            # Update in-memory set and persist to file
             if role == "Approved":
                 APPROVED_USERS.add(target_id)
-            elif role == "Blocked" and target_id in APPROVED_USERS:
-                APPROVED_USERS.remove(target_id)
+            elif role in ("Blocked", "Basic"):
+                APPROVED_USERS.discard(target_id)
+            _save_approved_users()
                 
             await show_user_details(update, context, target_id)
         else:

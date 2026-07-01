@@ -3,6 +3,9 @@
 .env.local
 .env.production
 
+# Approved users (managed by bot)
+approved_users.txt
+
 # Python
 __pycache__/
 *.py[cod]
