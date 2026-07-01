@@ -707,22 +707,27 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_user_state(user_id, ISSUE_HISTORY)
     
 async def show_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Displays the Quick Admin Dashboard."""
+    """Displays the Admin Dashboard."""
     user_id = update.effective_user.id
     if not is_admin(user_id):
         return
 
     keyboard = [
-        [InlineKeyboardButton("🧠 System Health", callback_data="admin_health")],
-        [InlineKeyboardButton("📜 Logs", callback_data="admin_logs")],
-        [InlineKeyboardButton("👤 User History", callback_data="admin_user_history")],
-        [InlineKeyboardButton("🛡 Admin Audit", callback_data="admin_audit")],
+        [InlineKeyboardButton("📊 System Health", callback_data="admin_health"),
+         InlineKeyboardButton("📜 Logs", callback_data="admin_logs")],
+        [InlineKeyboardButton("👥 Bot Users", callback_data="page_user_list"),
+         InlineKeyboardButton("🛡 Audit Trail", callback_data="admin_audit")],
         [InlineKeyboardButton("🔄 Reset User", callback_data="admin_reset")],
-        [InlineKeyboardButton("🗄 DB Tools", callback_data="admin_db")],
-        [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="nav_menu")]
+        [InlineKeyboardButton("🗄 Database", callback_data="admin_db")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await send_and_track_message(update, context, text="👑 *Admin Dashboard*\n\nSelect a management tool:", reply_markup=reply_markup)
+    msg = (
+        "⚙️ *Admin Panel*\n"
+        "━━━━━━━━━━━━━━━\n"
+        "Manage your library bot from here."
+    )
+    await send_and_track_message(update, context, text=msg, reply_markup=reply_markup)
     set_user_state(user_id, ADMIN_DASHBOARD)
 
 async def show_admin_db_tools(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -733,13 +738,15 @@ async def show_admin_db_tools(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     keyboard = [
         [InlineKeyboardButton("⬇️ Download Database", callback_data="admin_export")],
-        [InlineKeyboardButton("🔙 Back to Dashboard", callback_data="admin_dash")]
+        [InlineKeyboardButton("📤 Upload Database", callback_data="admin_import_info")],
+        [InlineKeyboardButton("🔙 Back", callback_data="admin_dash")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     msg = (
-        "🗄 *Database Management*\n\n"
-        "⬇️ *Download* — Export the current database.\n"
-        "📤 *Upload* — Just send a `.db` file directly and it auto-imports!"
+        "🗄 *Database*\n"
+        "━━━━━━━━━━━━━━━\n"
+        "⬇️ *Download* — Export current database\n"
+        "📤 *Upload* — Send a `.db` file to auto-import"
     )
     
     if update.callback_query:
@@ -1169,6 +1176,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_admin_db_tools(update, context)
         elif data == "admin_export":
             await handle_db_export(update, context)
+        elif data == "admin_import_info":
+            await query.answer("💡 Just send a .db file in chat — it auto-imports!", show_alert=True)
+        elif data == "page_user_list":
+            USER_PAGINATION_CONTEXT[user_id] = {"page": 1}
+            await send_bot_users_page(update, context, user_id, 1)
         return
 
     # 6. Admin Log Navigation
@@ -1522,64 +1534,64 @@ async def show_admin_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(f"{API_BASE}/health")
             data = response.json()
-        
-        status = "✅ OK" if data["status"] == "ok" else "❌ FAIL"
-        db_status = "✅ Present" if data["database_present"] else "❌ Missing"
-        
+
+        status = "🟢 Running" if data["status"] == "ok" else "🔴 Down"
+        db_status = "🟢 Present" if data["database_present"] else "🔴 Missing"
+
         msg = (
-            f"🧠 *System Health*\n\n"
-            f"🤖 *Bot Status:* Running\n"
+            f"📊 *System Health*\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"🤖 *Bot:* 🟢 Running\n"
             f"⚙️ *Backend:* {status}\n"
             f"📁 *Database:* {db_status}\n"
-            f"🕒 *Timestamp:* {data['timestamp']}\n"
-            f"🔌 *Port:* {data['port']}\n"
+            f"🕒 *Last Check:* {data['timestamp']}"
         )
-        
+
         keyboard = [
             [InlineKeyboardButton("🔄 Refresh", callback_data="admin_health")],
-            [InlineKeyboardButton("🔙 Back to Dashboard", callback_data="admin_dash")]
+            [InlineKeyboardButton("🔙 Back", callback_data="admin_dash")]
         ]
-        
+
         if update.callback_query:
             await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         else:
             await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
         logger.error(f"Error in show_admin_health: {e}")
-        await send_and_track_message(update, context, text="⚠️ *Error*\n\nFailed to fetch system health status.")
+        await send_and_track_message(update, context, text="⚠️ *Error*\n\nFailed to fetch system health.")
 
 async def show_admin_logs(update: Update, context: ContextTypes.DEFAULT_TYPE, level: str, page: int):
     """Shows in-memory logs with pagination."""
     logs = in_memory_logs.get_logs(level)
-    logs.reverse() # Show newest first
-    
+    logs.reverse()
+
     page_size = 10
     total_pages = (len(logs) + page_size - 1) // page_size if logs else 1
     start_idx = (page - 1) * page_size
     end_idx = start_idx + page_size
     page_logs = logs[start_idx:end_idx]
-    
-    msg = f"📜 *System Logs*\n\nFilter: {level} — Page {page}/{total_pages}\n\n"
+
+    msg = f"📜 *Logs* — `{level}` ({page}/{total_pages})\n━━━━━━━━━━━━━━━\n\n"
     if not page_logs:
-        msg += "_No logs found for this filter._"
+        msg += "_No logs found._"
     else:
         for l in page_logs:
-            msg += f"🕒 `{l['timestamp']}`\n`{l['level']}`: {l['message'][:100]}\n\n"
-            
+            msg += f"`{l['timestamp']}`\n{l['message'][:100]}\n\n"
+
     keyboard = []
     nav_row = []
     if page > 1:
-        nav_row.append(InlineKeyboardButton("⏮ Prev", callback_data=f"log_{level}_{page-1}"))
+        nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"log_{level}_{page-1}"))
     if page < total_pages:
-        nav_row.append(InlineKeyboardButton("⏭ Next", callback_data=f"log_{level}_{page+1}"))
+        nav_row.append(InlineKeyboardButton("➡️", callback_data=f"log_{level}_{page+1}"))
     if nav_row:
         keyboard.append(nav_row)
-        
+
     keyboard.append([
-        InlineKeyboardButton("❗ Errors", callback_data="log_ERROR_1"),
+        InlineKeyboardButton("❌ Errors", callback_data="log_ERROR_1"),
         InlineKeyboardButton("⚠️ Warnings", callback_data="log_WARNING_1")
     ])
-    keyboard.append([InlineKeyboardButton("🔙 Back to Dashboard", callback_data="admin_dash")])
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_dash")])
     
     if update.callback_query:
         await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
@@ -1592,36 +1604,36 @@ async def show_admin_audit(update: Update, context: ContextTypes.DEFAULT_TYPE, f
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(f"{API_BASE}/get_admin_actions", json={"page": page, "filter": filter_type})
             res_data = response.json()
-            
+
         if res_data["status"] != "ok":
             await send_and_track_message(update, context, text="⚠️ *Error*\n\nFailed to fetch audit log.")
             return
 
         actions = res_data["data"]
-        msg = f"🛡 *Admin Audit Log*\n\nFilter: {filter_type.capitalize()}\n\n"
-        
+        msg = f"🛡 *Audit Trail* — {filter_type.capitalize()} ({page})\n━━━━━━━━━━━━━━━\n\n"
+
         if not actions:
-            msg += "_No actions recorded for this filter._"
+            msg += "_No actions recorded._"
         else:
             for a in actions:
-                target = f" (User: `{a['target_user_id']}`)" if a['target_user_id'] else ""
-                msg += f"🕒 `{a['created_at']}`\n⚡ *{a['action']}*{target}\n📝 {a['details']}\n\n"
-                
+                target = f" → `{a['target_user_id']}`" if a['target_user_id'] else ""
+                msg += f"`{a['created_at']}`\n*{a['action']}*{target}\n{a['details']}\n\n"
+
         keyboard = []
         nav_row = []
         if page > 1:
-            nav_row.append(InlineKeyboardButton("⏮ Prev", callback_data=f"audit_{filter_type}_{page-1}"))
+            nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"audit_{filter_type}_{page-1}"))
         if len(actions) == 10:
-            nav_row.append(InlineKeyboardButton("⏭ Next", callback_data=f"audit_{filter_type}_{page+1}"))
+            nav_row.append(InlineKeyboardButton("➡️", callback_data=f"audit_{filter_type}_{page+1}"))
         if nav_row:
             keyboard.append(nav_row)
-            
+
         keyboard.append([
             InlineKeyboardButton("All", callback_data="audit_all_1"),
             InlineKeyboardButton("Access", callback_data="audit_access_1"),
             InlineKeyboardButton("Resets", callback_data="audit_reset_1")
         ])
-        keyboard.append([InlineKeyboardButton("🔙 Back to Dashboard", callback_data="admin_dash")])
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_dash")])
         
         if update.callback_query:
             await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
