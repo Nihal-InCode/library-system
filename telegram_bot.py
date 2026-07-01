@@ -79,6 +79,8 @@ RESULT_TTL_SECONDS = LONG_DELETE_SECONDS
 CLEANUP_CONTEXT = {}  # {user_id: {"menu_tap_id": int, "prompt_id": int, "last_result_id": int}}
 DELETION_TASKS = {}  # {(chat_id, message_id): asyncio.Task}
 LAST_BOT_MESSAGES = {}  # {user_id: message_id} (Tracks last menu/prompt for replacement)
+COUNTDOWN_TASKS = {}  # {(chat_id, message_id): asyncio.Task}
+ORIGINAL_TEXTS = {}  # {(chat_id, message_id): str}
 PAGE_SIZE = 5
 ANALYTICS_PAGE_SIZE = 10
 
@@ -160,6 +162,12 @@ async def run_clean_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _perform_scheduled_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int, show_vanish: bool):
     """Internal coroutine to handle delay, animation, and deletion."""
     try:
+        # 0. Cancel any running countdown for this message
+        old_countdown = COUNTDOWN_TASKS.pop((chat_id, message_id), None)
+        if old_countdown:
+            old_countdown.cancel()
+        ORIGINAL_TEXTS.pop((chat_id, message_id), None)
+
         # 1. Wait for the visible period (minus animation time)
         wait_time = max(0, delay - VANISH_ANIMATION_SECONDS)
         await asyncio.sleep(wait_time)
@@ -172,7 +180,6 @@ async def _perform_scheduled_delete(context: ContextTypes.DEFAULT_TYPE, chat_id:
                 try:
                     await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=frame)
                 except Exception:
-                    # If edit fails (e.g. 400 Bad Request), skip animation
                     break
                 await asyncio.sleep(frame_delay)
         
@@ -183,7 +190,6 @@ async def _perform_scheduled_delete(context: ContextTypes.DEFAULT_TYPE, chat_id:
     except Exception:
         pass
     finally:
-        # Cleanup task tracking only if this is still the active task
         if DELETION_TASKS.get((chat_id, message_id)) == asyncio.current_task():
             DELETION_TASKS.pop((chat_id, message_id), None)
 
@@ -193,6 +199,12 @@ async def schedule_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, mess
     old_task = DELETION_TASKS.pop((chat_id, message_id), None)
     if old_task:
         old_task.cancel()
+    
+    # Cancel any running countdown for this message
+    old_countdown = COUNTDOWN_TASKS.pop((chat_id, message_id), None)
+    if old_countdown:
+        old_countdown.cancel()
+    ORIGINAL_TEXTS.pop((chat_id, message_id), None)
         
     task = asyncio.create_task(_perform_scheduled_delete(context, chat_id, message_id, delay, show_vanish))
     DELETION_TASKS[(chat_id, message_id)] = task
@@ -206,8 +218,52 @@ async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id:
     """Schedules a message for deletion after a long delay (default 300s)."""
     return await schedule_delete(context, chat_id, message_id, delay, show_vanish)
 
+def _build_countdown_footer(seconds_left: int) -> str:
+    """Build a clean countdown timer footer."""
+    if seconds_left >= 60:
+        m, s = divmod(seconds_left, 60)
+        timer = f"{m}m {s:02d}s" if s else f"{m}m"
+    else:
+        timer = f"{seconds_left}s"
+    return f"\n\n⏱ _Auto-delete in {timer}_"
+
+async def _live_countdown(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, total_delay: int):
+    """Periodically edits a message to show a live countdown timer."""
+    try:
+        await asyncio.sleep(10)  # Initial wait before first update
+
+        elapsed = 10
+        while elapsed < total_delay - VANISH_ANIMATION_SECONDS:
+            remaining = total_delay - elapsed
+            key = (chat_id, message_id)
+            original = ORIGINAL_TEXTS.get(key, "")
+            footer = _build_countdown_footer(remaining)
+            full_text = f"{original}{footer}"
+
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=message_id,
+                    text=full_text, parse_mode='Markdown'
+                )
+            except Exception:
+                pass  # Message may have been deleted or edited already
+
+            # Update frequency: every 30s if >60s left, every 5s if <=60s
+            if remaining > 60:
+                await asyncio.sleep(30)
+                elapsed += 30
+            else:
+                await asyncio.sleep(5)
+                elapsed += 5
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+    finally:
+        COUNTDOWN_TASKS.pop((chat_id, message_id), None)
+
 async def send_and_track_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = None, photo: bytes = None, reply_markup=None, parse_mode='Markdown', auto_delete: bool = True, delay: int = LONG_DELETE_SECONDS, is_result: bool = False, cleanup_previous: bool = True):
-    """Sends a message, tracks it, and schedules auto-deletion."""
+    """Sends a message, tracks it, and schedules auto-deletion with live countdown."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
@@ -216,28 +272,22 @@ async def send_and_track_message(update: Update, context: ContextTypes.DEFAULT_T
         await safe_delete_message(context, chat_id, LAST_BOT_MESSAGES[user_id])
         LAST_BOT_MESSAGES.pop(user_id)
 
-    # 2. Send new message
+    # 2. Send new message (no static watermark — live countdown handles it)
     sent_msg = None
     
-    # Add auto-delete warning if it's a result or prompt (not for quick deletions)
-    display_text = text
-    if auto_delete and text and delay >= 45:
-        warning_text = f"\n\n⏳ _This message will auto-delete in {delay // 60} minutes_" if delay >= 60 else f"\n\n⏳ _This message will auto-delete in {delay} seconds_"
-        display_text = f"{text}{warning_text}"
-
     try:
         if photo:
             sent_msg = await context.bot.send_photo(
                 chat_id=chat_id,
                 photo=photo,
-                caption=display_text,
+                caption=text,
                 reply_markup=reply_markup,
                 parse_mode=parse_mode
             )
         elif text:
             sent_msg = await context.bot.send_message(
                 chat_id=chat_id,
-                text=display_text,
+                text=text,
                 reply_markup=reply_markup,
                 parse_mode=parse_mode
             )
@@ -248,23 +298,27 @@ async def send_and_track_message(update: Update, context: ContextTypes.DEFAULT_T
     if sent_msg:
         # 3. Track this message
         if is_result:
-            # Results are tracked separately so they don't get deleted by the next Menu/Prompt
             ensure_user_context(user_id)
             
-            # Delete previous result immediately if it exists (Keep only final result)
             last_id = CLEANUP_CONTEXT[user_id].get("last_result_id")
             if last_id:
                 await safe_delete_message(context, chat_id, last_id)
             
             CLEANUP_CONTEXT[user_id]["last_result_id"] = sent_msg.message_id
         else:
-            # Menus and Prompts are tracked for immediate replacement
             LAST_BOT_MESSAGES[user_id] = sent_msg.message_id
         
-        # 4. Schedule auto-deletion task
-        if auto_delete:
-            # Enable vanish for all tracked messages as per requirement
+        # 4. Schedule auto-deletion + live countdown
+        if auto_delete and text:
+            ORIGINAL_TEXTS[(chat_id, sent_msg.message_id)] = text
             await schedule_delete(context, chat_id, sent_msg.message_id, delay, show_vanish=True)
+            
+            # Start live countdown only for longer delays (skip for quick deletes)
+            if delay >= 30:
+                countdown = asyncio.create_task(
+                    _live_countdown(context, chat_id, sent_msg.message_id, delay)
+                )
+                COUNTDOWN_TASKS[(chat_id, sent_msg.message_id)] = countdown
             
     return sent_msg
 
