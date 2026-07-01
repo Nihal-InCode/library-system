@@ -1206,8 +1206,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 3. Analytics Actions
     if data.startswith("ana_"):
-        if not is_admin(user_id):
-            await query.answer("🔒 Admin only", show_alert=True)
+        if not is_authorized(user_id):
+            await query.answer("🔒 Access required", show_alert=True)
             return
             
         if data == "ana_back":
