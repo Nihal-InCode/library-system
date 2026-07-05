@@ -1943,30 +1943,43 @@ async def show_presentations_list(update: Update, context: ContextTypes.DEFAULT_
         # Cache for this user
         _PRESENTATIONS_CACHE[user_id] = presentations
 
-        # Number emojis
-        num_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+        # Number circle symbols
+        num_symbols = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩",
+                       "⑪", "⑫", "⑬", "⑭", "⑮", "⑯", "⑰", "⑱", "⑲", "⑳"]
+
+        # Month names
+        months = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+        def format_date(date_str):
+            """Convert YYYY-MM-DD to DD Mon YYYY"""
+            try:
+                parts = date_str.split("-")
+                day = int(parts[2])
+                month = months[int(parts[1])]
+                year = parts[0]
+                return f"{day:02d} {month} {year}"
+            except Exception:
+                return date_str
 
         # Build card-style list
-        msg = "📂 PRESENTATIONS\n"
-        msg += "Browse and download study materials\n"
-        msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        msg = "🎓 PRESENTATIONS\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
 
         for i, pres in enumerate(presentations, 1):
             topic = pres.get('topic', 'Untitled')
             presenter = pres.get('presenter', 'Unknown')
             event_date = pres.get('event_date', '')
-            file_name = pres.get('file_name', '')
-            ext = file_name.split('.')[-1].upper() if file_name else '?'
 
-            emoji = num_emojis[i-1] if i <= len(num_emojis) else f"({i})"
+            num = num_symbols[i-1] if i <= len(num_symbols) else f"{i}."
 
-            msg += f"{emoji}  {topic}\n"
-            msg += f"     👤 {presenter}\n"
-            msg += f"     📅 {event_date}  •  📄 {ext}\n\n"
+            msg += f"\n🔹 {num} {topic}\n"
+            msg += f"   👤 : {presenter}\n"
+            msg += f"   🗓️ : {format_date(event_date)}\n"
 
-        msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        msg += f"📊 {len(presentations)} files available\n\n"
-        msg += "Reply with a number to download"
+        msg += "\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        msg += f"📚 Available: {len(presentations)} files\n"
+        msg += f"👉 Reply with 1–{len(presentations)} to download."
 
         keyboard = [[InlineKeyboardButton("Back to Menu", callback_data="nav_menu")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
