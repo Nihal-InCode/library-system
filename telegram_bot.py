@@ -175,6 +175,7 @@ ISSUE_HISTORY = "ISSUE_HISTORY"
 ADMIN_DASHBOARD = "ADMIN_DASHBOARD"
 ADMIN_RESET_USER = "ADMIN_RESET_USER"
 ADMIN_USER_HISTORY = "ADMIN_USER_HISTORY"
+BROWSING_PRESENTATIONS = "BROWSING_PRESENTATIONS"
 
 # --- STATE HELPERS ---
 def get_user_state(user_id: int) -> str:
@@ -641,11 +642,10 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif text == "📎 Presentations":
         if not is_authorized(user_id):
-            await send_and_track_message(update, context, text="🔒 *Access Required*\n\nPresentations require authorization.")
+            await send_and_track_message(update, context, text="Access Required. Presentations require authorization.")
             set_user_state(user_id, CHOOSING)
             return
-        await show_presentations_page(update, context, page=1)
-        set_user_state(user_id, CHOOSING)
+        await show_presentations_list(update, context)
     
     elif text == "🔐 Request Access":
         if is_authorized(user_id):
@@ -1256,18 +1256,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Presentations callbacks
-    if data.startswith("pres_page_"):
-        page = int(data.split("_")[2])
-        await show_presentations_page(update, context, page)
-        return
-
-    if data == "pres_refresh":
-        await show_presentations_page(update, context, page=1)
-        return
-
     if data.startswith("pres_dl_"):
         filename = data[8:]  # Remove "pres_dl_" prefix
         await download_presentation(update, context, filename)
+        return
+
+    if data == "pres_list":
+        await show_presentations_list(update, context)
         return
 
     # 2. Navigation Actions mechanism (State transitions via button)
@@ -1379,7 +1374,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Message from user {user_id} in state {current_state}: {msg_text[:50]}")
     
     # Clean Chat: If we are in an input state, clean up the previous menu tap, prompt, and current input
-    if current_state in [SEARCHING_BOOK, CHECKING_STATUS, STUDENT_DETAILS, ISSUE_HISTORY]:
+    if current_state in [SEARCHING_BOOK, CHECKING_STATUS, STUDENT_DETAILS, ISSUE_HISTORY, BROWSING_PRESENTATIONS]:
         await run_clean_chat(update, context)
     elif current_state == CHOOSING:
         # Store the menu button tap ID and schedule its deletion
@@ -1397,6 +1392,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_student_details(update, context)
         elif current_state == ISSUE_HISTORY:
             await handle_issue_history(update, context)
+        elif current_state == BROWSING_PRESENTATIONS:
+            await handle_presentation_input(update, context)
         elif current_state == ADMIN_RESET_USER:
             await handle_admin_reset_user(update, context)
         elif current_state == ADMIN_USER_HISTORY:
@@ -1900,118 +1897,121 @@ async def send_analytics_page(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ── PRESENTATIONS ────────────────────────────────────────────
 
 PRESENTATIONS_GITHUB_REPO = os.getenv("PRESENTATIONS_GITHUB_REPO", GITHUB_REPO)
-PRESENTATIONS_PAGE_SIZE = 5
+
+# Cache for presentations list (avoids re-fetching on every number input)
+_PRESENTATIONS_CACHE = {}  # {user_id: [list of presentations]}
 
 async def cmd_presentations(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /presentations command — list available presentations from GitHub."""
-    await show_presentations_page(update, context, page=1)
+    """Handle /presentations command."""
+    await show_presentations_list(update, context)
 
-async def show_presentations_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int):
-    """Fetch presentations from GitHub index file and display with inline buttons."""
+async def show_presentations_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fetch all presentations and show as a numbered list. User types number to download."""
+    user_id = update.effective_user.id
     try:
-        # Fetch presentations_index.json from GitHub
         index_url = f"https://raw.githubusercontent.com/{PRESENTATIONS_GITHUB_REPO}/main/presentations_index.json"
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(index_url)
 
         if response.status_code != 200:
-            msg = "📂 *Presentations*\n\n_No presentations available yet._\n\nPresentations are synced from the library desktop app."
-            keyboard = [[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]
+            msg = (
+                "📂 PRESENTATIONS\n\n"
+                "No presentations available yet.\n"
+                "Presentations are synced from the library desktop app."
+            )
+            keyboard = [[InlineKeyboardButton("Back to Menu", callback_data="nav_menu")]]
             if update.callback_query:
-                await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+                await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
             else:
                 await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard), is_result=True)
             return
 
         presentations = response.json()
         if not presentations:
-            msg = "📂 *Presentations*\n\n_No presentations available yet._\n\nPresentations are synced from the library desktop app."
-            keyboard = [[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]
+            msg = (
+                "📂 PRESENTATIONS\n\n"
+                "No presentations available yet.\n"
+                "Presentations are synced from the library desktop app."
+            )
+            keyboard = [[InlineKeyboardButton("Back to Menu", callback_data="nav_menu")]]
             if update.callback_query:
-                await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+                await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
             else:
                 await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard), is_result=True)
             return
 
-        total = len(presentations)
-        total_pages = (total + PRESENTATIONS_PAGE_SIZE - 1) // PRESENTATIONS_PAGE_SIZE
-        page = max(1, min(page, total_pages))
+        # Cache for this user
+        _PRESENTATIONS_CACHE[user_id] = presentations
 
-        start_idx = (page - 1) * PRESENTATIONS_PAGE_SIZE
-        page_items = presentations[start_idx:start_idx + PRESENTATIONS_PAGE_SIZE]
+        # Build numbered list
+        msg = "📎 PRESENTATIONS\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        # Build professional message
-        msg = "📎 *PRESENTATIONS*\n\n"
-        msg += "_Browse and download college presentation materials._\n\n"
-        msg += "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        msg += f"📄 _Page {page} of {total_pages} • {total} files total_\n"
-        msg += "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-
-        keyboard = []
-
-        for i, pres in enumerate(page_items, 1 + start_idx):
+        for i, pres in enumerate(presentations, 1):
             topic = pres.get('topic', 'Untitled')
             presenter = pres.get('presenter', 'Unknown')
             event_date = pres.get('event_date', '')
             file_name = pres.get('file_name', '')
             ext = file_name.split('.')[-1].upper() if file_name else '?'
 
-            msg += f"*{i})* 📄 *{topic}*\n"
-            msg += f"    👤 _{presenter}_ • 📅 _{event_date}_ • 🔹 {ext}\n\n"
+            msg += f"  {i}. {topic}\n"
+            msg += f"      By: {presenter} | {event_date} | {ext}\n"
 
-            # Download button using index position
-            safe_name = file_name.replace(' ', '_')
-            keyboard.append([InlineKeyboardButton(f"⬇️  Download  {i})", callback_data=f"pres_dl_{safe_name}")])
+        msg += "\n━━━━━━━━━━━━━━━━━━━━\n"
+        msg += f"Total: {len(presentations)} files\n\n"
+        msg += "Type the number to download (e.g. 1)"
 
-        # Pagination
-        nav_row = []
-        if page > 1:
-            nav_row.append(InlineKeyboardButton("⏮ Prev", callback_data=f"pres_page_{page-1}"))
-        if page < total_pages:
-            nav_row.append(InlineKeyboardButton("⏭ Next", callback_data=f"pres_page_{page+1}"))
-        if nav_row:
-            keyboard.append(nav_row)
-
-        keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="pres_refresh")])
-        keyboard.append([InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")])
-
+        keyboard = [[InlineKeyboardButton("Back to Menu", callback_data="nav_menu")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         if update.callback_query:
-            await update.callback_query.edit_message_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
+            await update.callback_query.edit_message_text(msg, reply_markup=reply_markup)
         else:
             await send_and_track_message(update, context, text=msg, reply_markup=reply_markup, is_result=True)
 
+        set_user_state(user_id, BROWSING_PRESENTATIONS)
+
     except Exception as e:
         logger.error(f"Presentations error: {e}")
-        error_msg = "⚠️ *Error*\n\nFailed to load presentations. Please try again."
-        keyboard = [[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]
+        error_msg = "Error loading presentations. Please try again."
+        keyboard = [[InlineKeyboardButton("Back to Menu", callback_data="nav_menu")]]
         if update.callback_query:
-            await update.callback_query.edit_message_text(error_msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            await update.callback_query.edit_message_text(error_msg, reply_markup=InlineKeyboardMarkup(keyboard))
         else:
             await send_and_track_message(update, context, text=error_msg, reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def download_presentation(update: Update, context: ContextTypes.DEFAULT_TYPE, filename: str):
-    """Download a presentation file from GitHub and send it to the user."""
-    query = update.callback_query
-    await query.answer("⏳ Downloading file...")
+async def handle_presentation_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle user typing a number to download a presentation."""
+    user_id = update.effective_user.id
+    text = (update.message.text or "").strip()
+
+    # Check if user typed a number
+    if not text.isdigit():
+        await send_and_track_message(update, context, text="Please type a number (e.g. 1) to download, or type /menu to go back.")
+        return
+
+    num = int(text)
+    cache = _PRESENTATIONS_CACHE.get(user_id, [])
+
+    if not cache:
+        await send_and_track_message(update, context, text="Session expired. Type /presentations to reload the list.")
+        set_user_state(user_id, CHOOSING)
+        return
+
+    if num < 1 or num > len(cache):
+        await send_and_track_message(update, context, text=f"Invalid number. Choose between 1 and {len(cache)}.")
+        return
+
+    pres = cache[num - 1]
+    filename = pres.get('file_name', '')
+    topic = pres.get('topic', 'Untitled')
+    presenter = pres.get('presenter', 'Unknown')
+
+    # Send loading message
+    loading_msg = await send_and_track_message(update, context, text=f"Downloading: {topic}...")
 
     try:
-        # Try to get github_url from index file
-        github_url = None
-        try:
-            index_url = f"https://raw.githubusercontent.com/{PRESENTATIONS_GITHUB_REPO}/main/presentations_index.json"
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                index_response = await client.get(index_url)
-            if index_response.status_code == 200:
-                for pres in index_response.json():
-                    if pres.get('file_name', '') == filename:
-                        github_url = pres.get('github_url', '')
-                        break
-        except Exception:
-            pass
-
-        # Fallback: construct URL from filename
+        github_url = pres.get('github_url', '')
         if not github_url:
             github_url = f"https://raw.githubusercontent.com/{PRESENTATIONS_GITHUB_REPO}/main/presentations/{filename}"
 
@@ -2019,56 +2019,83 @@ async def download_presentation(update: Update, context: ContextTypes.DEFAULT_TY
             response = await client.get(github_url)
 
         if response.status_code != 200:
-            await query.message.reply_text("⚠️ *File Not Found*\n\nThe file could not be downloaded from the server.")
+            await send_and_track_message(update, context, text="File not found on server. Try again later.")
             return
 
-        # Build clean display name from index or filename
-        display_name = filename
-        try:
-            index_url = f"https://raw.githubusercontent.com/{PRESENTATIONS_GITHUB_REPO}/main/presentations_index.json"
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                index_response = await client.get(index_url)
-            if index_response.status_code == 200:
-                for pres in index_response.json():
-                    if pres.get('file_name', '') == filename:
-                        topic = pres.get('topic', '')
-                        presenter = pres.get('presenter', '')
-                        ext = filename.split('.')[-1]
-                        if topic and presenter:
-                            display_name = f"{topic} - {presenter}.{ext}"
-                        break
-        except Exception:
-            pass
+        ext = filename.split('.')[-1]
+        display_name = f"{topic} - {presenter}.{ext}"
 
-        # Build caption with full details
-        caption = f"📎 *{display_name}*\n\n_Downloaded from Markhins Central Library_"
-        try:
-            index_url = f"https://raw.githubusercontent.com/{PRESENTATIONS_GITHUB_REPO}/main/presentations_index.json"
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                index_response = await client.get(index_url)
-            if index_response.status_code == 200:
-                for pres in index_response.json():
-                    if pres.get('file_name', '') == filename:
-                        caption = (
-                            f"📎 *{pres.get('topic', filename)}*\n\n"
-                            f"👤 _{pres.get('presenter', 'Unknown')}_\n"
-                            f"📅 _{pres.get('event_date', '')}_\n\n"
-                            f"_Downloaded from Markhins Central Library_"
-                        )
-                        break
-        except Exception:
-            pass
+        caption = (
+            f"📎 {topic}\n\n"
+            f"By: {presenter}\n"
+            f"Date: {pres.get('event_date', '')}\n\n"
+            f"Downloaded from Markhins Central Library"
+        )
 
-        await query.message.reply_document(
+        await update.message.reply_document(
             document=response.content,
             filename=display_name,
-            caption=caption,
-            parse_mode='Markdown'
+            caption=caption
         )
 
     except Exception as e:
         logger.error(f"Presentation download error: {e}")
-        await query.message.reply_text("⚠️ *Download Failed*\n\nAn error occurred while downloading the file.")
+        await send_and_track_message(update, context, text="Download failed. Please try again.")
+
+async def download_presentation(update: Update, context: ContextTypes.DEFAULT_TYPE, filename: str):
+    """Download a presentation via inline button callback."""
+    query = update.callback_query
+    await query.answer("Downloading file...")
+
+    try:
+        # Fetch index to get metadata
+        index_url = f"https://raw.githubusercontent.com/{PRESENTATIONS_GITHUB_REPO}/main/presentations_index.json"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            index_response = await client.get(index_url)
+
+        github_url = None
+        topic = filename
+        presenter = "Unknown"
+        event_date = ""
+
+        if index_response.status_code == 200:
+            for pres in index_response.json():
+                if pres.get('file_name', '') == filename:
+                    github_url = pres.get('github_url', '')
+                    topic = pres.get('topic', filename)
+                    presenter = pres.get('presenter', 'Unknown')
+                    event_date = pres.get('event_date', '')
+                    break
+
+        if not github_url:
+            github_url = f"https://raw.githubusercontent.com/{PRESENTATIONS_GITHUB_REPO}/main/presentations/{filename}"
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(github_url)
+
+        if response.status_code != 200:
+            await query.message.reply_text("File not found on server.")
+            return
+
+        ext = filename.split('.')[-1]
+        display_name = f"{topic} - {presenter}.{ext}"
+
+        caption = (
+            f"📎 {topic}\n\n"
+            f"By: {presenter}\n"
+            f"Date: {event_date}\n\n"
+            f"Downloaded from Markhins Central Library"
+        )
+
+        await query.message.reply_document(
+            document=response.content,
+            filename=display_name,
+            caption=caption
+        )
+
+    except Exception as e:
+        logger.error(f"Presentation download error: {e}")
+        await query.message.reply_text("Download failed. Please try again.")
 
 if __name__ == '__main__':
     if not BOT_RUNNING:
