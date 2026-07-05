@@ -1916,8 +1916,8 @@ async def show_presentations_list(update: Update, context: ContextTypes.DEFAULT_
         if response.status_code != 200:
             msg = (
                 "📂 PRESENTATIONS\n\n"
-                "No presentations available yet.\n"
-                "Presentations are synced from the library desktop app."
+                "No study materials available yet.\n"
+                "Check back later!"
             )
             keyboard = [[InlineKeyboardButton("Back to Menu", callback_data="nav_menu")]]
             if update.callback_query:
@@ -1930,8 +1930,8 @@ async def show_presentations_list(update: Update, context: ContextTypes.DEFAULT_
         if not presentations:
             msg = (
                 "📂 PRESENTATIONS\n\n"
-                "No presentations available yet.\n"
-                "Presentations are synced from the library desktop app."
+                "No study materials available yet.\n"
+                "Check back later!"
             )
             keyboard = [[InlineKeyboardButton("Back to Menu", callback_data="nav_menu")]]
             if update.callback_query:
@@ -1943,9 +1943,13 @@ async def show_presentations_list(update: Update, context: ContextTypes.DEFAULT_
         # Cache for this user
         _PRESENTATIONS_CACHE[user_id] = presentations
 
-        # Build numbered list
-        msg = "📎 PRESENTATIONS\n"
-        msg += "━━━━━━━━━━━━━━━━━━━━\n\n"
+        # Number emojis
+        num_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+
+        # Build card-style list
+        msg = "📂 PRESENTATIONS\n"
+        msg += "Browse and download study materials\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
         for i, pres in enumerate(presentations, 1):
             topic = pres.get('topic', 'Untitled')
@@ -1954,12 +1958,15 @@ async def show_presentations_list(update: Update, context: ContextTypes.DEFAULT_
             file_name = pres.get('file_name', '')
             ext = file_name.split('.')[-1].upper() if file_name else '?'
 
-            msg += f"  {i}. {topic}\n"
-            msg += f"      By: {presenter} | {event_date} | {ext}\n"
+            emoji = num_emojis[i-1] if i <= len(num_emojis) else f"({i})"
 
-        msg += "\n━━━━━━━━━━━━━━━━━━━━\n"
-        msg += f"Total: {len(presentations)} files\n\n"
-        msg += "Type the number to download (e.g. 1)"
+            msg += f"{emoji}  {topic}\n"
+            msg += f"     👤 {presenter}\n"
+            msg += f"     📅 {event_date}  •  📄 {ext}\n\n"
+
+        msg += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        msg += f"📊 {len(presentations)} files available\n\n"
+        msg += "Reply with a number to download"
 
         keyboard = [[InlineKeyboardButton("Back to Menu", callback_data="nav_menu")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
