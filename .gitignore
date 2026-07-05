@@ -42,3 +42,6 @@ build_windows.bat
 DEPLOY.md
 check_schema.py
 dump_schema.py
+
+# Presentations (synced via GitHub API, not git)
+presentations/

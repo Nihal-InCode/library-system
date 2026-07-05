@@ -148,6 +148,54 @@ def send_message_to_multiple(
     return {"success": success_count, "errors": errors}
 
 
+def send_document(
+    chat_id: Union[int, str],
+    document_path: str,
+    caption: Optional[str] = None,
+    parse_mode: str = "HTML",
+    token: Optional[str] = None,
+) -> bool:
+    """
+    Send a document file via Telegram Bot API.
+
+    Args:
+        chat_id: Target chat ID
+        document_path: Path to the document file
+        caption: Optional caption text
+        parse_mode: Parse mode (HTML or Markdown)
+        token: Bot token (uses default if not provided)
+
+    Returns:
+        True if sent successfully, False otherwise
+    """
+    if token is None:
+        token = get_bot_token()
+
+    if not chat_id:
+        print("Warning: Telegram chat_id not configured")
+        return False
+
+    if not os.path.exists(document_path):
+        print(f"Warning: Document not found at {document_path}")
+        return False
+
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendDocument"
+        with open(document_path, "rb") as f:
+            files = {"document": f}
+            data = {
+                "chat_id": chat_id,
+                "parse_mode": parse_mode,
+            }
+            if caption:
+                data["caption"] = caption
+            response = requests.post(url, data=data, files=files, timeout=60)
+        return response.status_code == 200
+    except Exception as e:
+        print(f"Telegram send document error: {e}")
+        return False
+
+
 def send_photo_to_multiple(
     chat_ids: List[Union[int, str]],
     photo_path: str,

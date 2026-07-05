@@ -594,7 +594,8 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ["🔍 Find a Book", "📖 Check Status"],
             ["👤 Student Profile", "🕘 Reading History"],
             ["📊 Library Stats", "📊 Advanced Analytics"],
-            ["👥 Bot Users", "👑 Admin Dashboard"],
+            ["📎 Presentations", "👥 Bot Users"],
+            ["👑 Admin Dashboard"],
             ["❌ Exit"]
         ]
         msg = "📚 *MCL BOT*\n\n_Please select an option from the menu below._"
@@ -636,6 +637,14 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     elif text == "📊 Library Stats":
         await handle_book_count(update, context)
+        set_user_state(user_id, CHOOSING)
+    
+    elif text == "📎 Presentations":
+        if not is_authorized(user_id):
+            await send_and_track_message(update, context, text="🔒 *Access Required*\n\nPresentations require authorization.")
+            set_user_state(user_id, CHOOSING)
+            return
+        await show_presentations_page(update, context, page=1)
         set_user_state(user_id, CHOOSING)
     
     elif text == "🔐 Request Access":
@@ -1246,6 +1255,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_analytics_page(update, context, user_id)
         return
 
+    # Presentations callbacks
+    if data.startswith("pres_page_"):
+        page = int(data.split("_")[2])
+        await show_presentations_page(update, context, page)
+        return
+
+    if data == "pres_refresh":
+        await show_presentations_page(update, context, page=1)
+        return
+
+    if data.startswith("pres_dl_"):
+        filename = data[8:]  # Remove "pres_dl_" prefix
+        await download_presentation(update, context, filename)
+        return
+
     # 2. Navigation Actions mechanism (State transitions via button)
     if data == "nav_menu":
         SEARCH_CONTEXT.pop(user_id, None)  # Clear search context
@@ -1402,6 +1426,7 @@ def init_bot():
     # Add simple handlers instead of ConversationHandler
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('cancel', cancel))
+    application.add_handler(CommandHandler('presentations', cmd_presentations))
     application.add_handler(MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_callback))
     
@@ -1871,6 +1896,147 @@ async def send_analytics_page(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         logger.error(f"Analytics error: {e}")
         await query.message.edit_text("⚠️ *Error*\n\nFailed to generate report. Please try again.")
+
+# ── PRESENTATIONS ────────────────────────────────────────────
+
+PRESENTATIONS_GITHUB_REPO = os.getenv("PRESENTATIONS_GITHUB_REPO", GITHUB_REPO)
+PRESENTATIONS_PAGE_SIZE = 5
+
+async def cmd_presentations(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /presentations command — list available presentations from GitHub."""
+    await show_presentations_page(update, context, page=1)
+
+async def show_presentations_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int):
+    """Fetch presentations list from GitHub and display with inline buttons."""
+    try:
+        # Fetch presentations directory from GitHub API
+        api_url = f"https://api.github.com/repos/{PRESENTATIONS_GITHUB_REPO}/contents/presentations"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(api_url)
+            
+        if response.status_code != 200:
+            msg = "📂 *Presentations*\n\n_No presentations available yet._\n\nPresentations are synced from the library desktop app."
+            keyboard = [[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]
+            if update.callback_query:
+                await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            else:
+                await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard), is_result=True)
+            return
+
+        files = response.json()
+        # Filter only presentation files
+        valid_exts = ('.pdf', '.ppt', '.pptx', '.doc', '.docx')
+        pres_files = [f for f in files if f['name'].lower().endswith(valid_exts)]
+        
+        if not pres_files:
+            msg = "📂 *Presentations*\n\n_No presentations available yet._\n\nPresentations are synced from the library desktop app."
+            keyboard = [[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]
+            if update.callback_query:
+                await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            else:
+                await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard), is_result=True)
+            return
+
+        # Sort by filename (newest first since filenames have timestamps)
+        pres_files.sort(key=lambda f: f['name'], reverse=True)
+        
+        total = len(pres_files)
+        total_pages = (total + PRESENTATIONS_PAGE_SIZE - 1) // PRESENTATIONS_PAGE_SIZE
+        page = max(1, min(page, total_pages))
+        
+        start_idx = (page - 1) * PRESENTATIONS_PAGE_SIZE
+        page_files = pres_files[start_idx:start_idx + PRESENTATIONS_PAGE_SIZE]
+
+        # Build professional message
+        msg = f"📎 *PRESENTATIONS*\n\n"
+        msg += f"_Browse and download college presentation materials._\n\n"
+        msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        msg += f"📄 _Page {page} of {total_pages} • {total} files total_\n"
+        msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        keyboard = []
+        
+        for i, f in enumerate(page_files, 1 + start_idx):
+            name = f['name']
+            # Parse topic and presenter from filename: timestamp_topic_presenter.ext
+            parts = name.split('_', 2)
+            if len(parts) >= 3:
+                ext = parts[-1].split('.')[-1].upper()
+                topic_raw = parts[1].replace('-', ' ').title()
+                presenter_raw = parts[2].rsplit('.', 1)[0].replace('-', ' ').title()
+                msg += f"*{i})* 📄 `{topic_raw}`\n"
+                msg += f"    👤 _{presenter_raw}_ • 🔹 {ext}\n\n"
+            else:
+                ext = name.split('.')[-1].upper()
+                msg += f"*{i})* 📄 `{name}` • 🔹 {ext}\n\n"
+            
+            # Download button for each file
+            safe_name = name.replace(' ', '_')
+            keyboard.append([InlineKeyboardButton(f"⬇️  Download  {i})", callback_data=f"pres_dl_{safe_name}")])
+
+        # Pagination
+        nav_row = []
+        if page > 1:
+            nav_row.append(InlineKeyboardButton("⏮ Prev", callback_data=f"pres_page_{page-1}"))
+        if page < total_pages:
+            nav_row.append(InlineKeyboardButton("⏭ Next", callback_data=f"pres_page_{page+1}"))
+        if nav_row:
+            keyboard.append(nav_row)
+
+        keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="pres_refresh")])
+        keyboard.append([InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
+        else:
+            await send_and_track_message(update, context, text=msg, reply_markup=reply_markup, is_result=True)
+
+    except Exception as e:
+        logger.error(f"Presentations error: {e}")
+        error_msg = "⚠️ *Error*\n\nFailed to load presentations. Please try again."
+        keyboard = [[InlineKeyboardButton("🏠 Main Menu", callback_data="nav_menu")]]
+        if update.callback_query:
+            await update.callback_query.edit_message_text(error_msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        else:
+            await send_and_track_message(update, context, text=error_msg, reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def download_presentation(update: Update, context: ContextTypes.DEFAULT_TYPE, filename: str):
+    """Download a presentation file from GitHub and send it to the user."""
+    query = update.callback_query
+    await query.answer("⏳ Downloading file...")
+    
+    try:
+        raw_url = f"https://raw.githubusercontent.com/{PRESENTATIONS_GITHUB_REPO}/main/presentations/{filename}"
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(raw_url)
+        
+        if response.status_code != 200:
+            await query.message.reply_text("⚠️ *File Not Found*\n\nThe file could not be downloaded from the server.")
+            return
+
+        # Determine file type for display
+        ext = filename.split('.')[-1].lower()
+        display_name = filename
+        # Clean up filename for display: remove timestamp prefix
+        parts = filename.split('_', 2)
+        if len(parts) >= 3:
+            topic = parts[1].replace('-', ' ').title()
+            presenter = parts[2].rsplit('.', 1)[0].replace('-', ' ').title()
+            display_name = f"{topic} - {presenter}.{ext}"
+
+        # Send the file
+        await query.message.reply_document(
+            document=response.content,
+            filename=display_name,
+            caption=f"📎 *{display_name}*\n\n_Downloaded from Markhins Central Library_"
+        )
+
+    except Exception as e:
+        logger.error(f"Presentation download error: {e}")
+        await query.message.reply_text("⚠️ *Download Failed*\n\nAn error occurred while downloading the file.")
 
 if __name__ == '__main__':
     if not BOT_RUNNING:
