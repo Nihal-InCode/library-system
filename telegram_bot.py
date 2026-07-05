@@ -1943,16 +1943,14 @@ async def show_presentations_list(update: Update, context: ContextTypes.DEFAULT_
         # Cache for this user
         _PRESENTATIONS_CACHE[user_id] = presentations
 
-        # Number circle symbols
-        num_symbols = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩",
-                       "⑪", "⑫", "⑬", "⑭", "⑮", "⑯", "⑰", "⑱", "⑲", "⑳"]
+        # Number emojis
+        num_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 
         # Month names
         months = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
         def format_date(date_str):
-            """Convert YYYY-MM-DD to DD Mon YYYY"""
             try:
                 parts = date_str.split("-")
                 day = int(parts[2])
@@ -1962,23 +1960,26 @@ async def show_presentations_list(update: Update, context: ContextTypes.DEFAULT_
             except Exception:
                 return date_str
 
-        # Build card-style list
+        # Build list
         msg = "🎓 PRESENTATIONS\n"
-        msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━\n"
 
         for i, pres in enumerate(presentations, 1):
             topic = pres.get('topic', 'Untitled')
             presenter = pres.get('presenter', 'Unknown')
             event_date = pres.get('event_date', '')
 
-            num = num_symbols[i-1] if i <= len(num_symbols) else f"{i}."
+            num = num_emojis[i-1] if i <= len(num_emojis) else f"{i}."
 
-            msg += f"\n🔹 {num} {topic}\n"
+            msg += f"\n{num}  {topic}\n"
             msg += f"   👤 : {presenter}\n"
             msg += f"   🗓️ : {format_date(event_date)}\n"
 
-        msg += "\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        msg += f"📚 Available: {len(presentations)} files\n"
+            if i < len(presentations):
+                msg += "\n - - - - - - - - - - - -\n"
+
+        msg += "\n━━━━━━━━━━━━━━━━━━━━\n"
+        msg += f"📚 Available : {len(presentations)} files\n"
         msg += f"👉 Reply with 1–{len(presentations)} to download."
 
         keyboard = [[InlineKeyboardButton("Back to Menu", callback_data="nav_menu")]]
