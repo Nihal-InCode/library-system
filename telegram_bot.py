@@ -1923,7 +1923,7 @@ async def show_presentations_list(update: Update, context: ContextTypes.DEFAULT_
             if update.callback_query:
                 await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
             else:
-                await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard), is_result=True)
+                await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard), is_result=True, delay=45)
             return
 
         presentations = response.json()
@@ -1937,7 +1937,7 @@ async def show_presentations_list(update: Update, context: ContextTypes.DEFAULT_
             if update.callback_query:
                 await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
             else:
-                await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard), is_result=True)
+                await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard), is_result=True, delay=45)
             return
 
         # Cache for this user
@@ -1988,7 +1988,7 @@ async def show_presentations_list(update: Update, context: ContextTypes.DEFAULT_
         if update.callback_query:
             await update.callback_query.edit_message_text(msg, reply_markup=reply_markup)
         else:
-            await send_and_track_message(update, context, text=msg, reply_markup=reply_markup, is_result=True)
+            await send_and_track_message(update, context, text=msg, reply_markup=reply_markup, is_result=True, delay=45)
 
         set_user_state(user_id, BROWSING_PRESENTATIONS)
 
@@ -1999,7 +1999,7 @@ async def show_presentations_list(update: Update, context: ContextTypes.DEFAULT_
         if update.callback_query:
             await update.callback_query.edit_message_text(error_msg, reply_markup=InlineKeyboardMarkup(keyboard))
         else:
-            await send_and_track_message(update, context, text=error_msg, reply_markup=InlineKeyboardMarkup(keyboard))
+            await send_and_track_message(update, context, text=error_msg, reply_markup=InlineKeyboardMarkup(keyboard), delay=45)
 
 async def handle_presentation_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle user typing a number to download a presentation."""
