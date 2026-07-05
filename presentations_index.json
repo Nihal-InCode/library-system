@@ -30,5 +30,13 @@
     "presenter": "HIDAY",
     "event_date": "2026-07-05",
     "github_url": "https://raw.githubusercontent.com/Nihal-InCode/library-system/main/presentations/20260705_214723_Residential status.pdf"
+  },
+  {
+    "id": 8,
+    "file_name": "BS4.pdf",
+    "topic": "TEST 005",
+    "presenter": "KASIM",
+    "event_date": "2026-07-05",
+    "github_url": "https://raw.githubusercontent.com/Nihal-InCode/library-system/main/presentations/20260705_214747_BS4.pdf"
   }
 ]
