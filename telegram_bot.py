@@ -1901,6 +1901,30 @@ PRESENTATIONS_GITHUB_REPO = os.getenv("PRESENTATIONS_GITHUB_REPO", GITHUB_REPO)
 # Cache for presentations list (avoids re-fetching on every number input)
 _PRESENTATIONS_CACHE = {}  # {user_id: [list of presentations]}
 
+async def _github_fetch_file(filepath):
+    """Fetch a file from GitHub via API (bypasses CDN cache of raw URLs)."""
+    api_url = f"https://api.github.com/repos/{PRESENTATIONS_GITHUB_REPO}/contents/{filepath}"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(api_url)
+    if response.status_code == 200:
+        import base64
+        data = response.json()
+        content = base64.b64decode(data['content']).decode('utf-8')
+        return content, response.status_code
+    return None, response.status_code
+
+async def _github_fetch_file_bytes(filepath):
+    """Fetch a file as bytes from GitHub via API (bypasses CDN cache)."""
+    api_url = f"https://api.github.com/repos/{PRESENTATIONS_GITHUB_REPO}/contents/{filepath}"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(api_url)
+    if response.status_code == 200:
+        import base64
+        data = response.json()
+        content = base64.b64decode(data['content'])
+        return content, response.status_code
+    return None, response.status_code
+
 async def cmd_presentations(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /presentations command."""
     await show_presentations_list(update, context)
@@ -1909,11 +1933,9 @@ async def show_presentations_list(update: Update, context: ContextTypes.DEFAULT_
     """Fetch all presentations and show as a numbered list. User types number to download."""
     user_id = update.effective_user.id
     try:
-        index_url = f"https://raw.githubusercontent.com/{PRESENTATIONS_GITHUB_REPO}/main/presentations_index.json"
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(index_url)
+        content, status = await _github_fetch_file("presentations_index.json")
 
-        if response.status_code != 200:
+        if status != 200 or not content:
             msg = (
                 "📂 PRESENTATIONS\n\n"
                 "No study materials available yet.\n"
@@ -1926,7 +1948,7 @@ async def show_presentations_list(update: Update, context: ContextTypes.DEFAULT_
                 await send_and_track_message(update, context, text=msg, reply_markup=InlineKeyboardMarkup(keyboard), is_result=True, delay=45)
             return
 
-        presentations = response.json()
+        presentations = json.loads(content)
         if not presentations:
             msg = (
                 "📂 PRESENTATIONS\n\n"
@@ -2032,14 +2054,16 @@ async def handle_presentation_input(update: Update, context: ContextTypes.DEFAUL
     loading_msg = await send_and_track_message(update, context, text=f"Downloading: {topic}...", delay=3)
 
     try:
+        # Get file path from github_url or construct it
         github_url = pres.get('github_url', '')
-        if not github_url:
-            github_url = f"https://raw.githubusercontent.com/{PRESENTATIONS_GITHUB_REPO}/main/presentations/{filename}"
+        if github_url and "/presentations/" in github_url:
+            filepath = "presentations/" + github_url.split("/presentations/")[1]
+        else:
+            filepath = f"presentations/{filename}"
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(github_url)
+        file_bytes, status = await _github_fetch_file_bytes(filepath)
 
-        if response.status_code != 200:
+        if status != 200 or not file_bytes:
             await send_and_track_message(update, context, text="File not found on server. Try again later.")
             return
 
@@ -2055,7 +2079,7 @@ async def handle_presentation_input(update: Update, context: ContextTypes.DEFAUL
         )
 
         await update.message.reply_document(
-            document=response.content,
+            document=file_bytes,
             filename=display_name,
             caption=caption
         )
@@ -2071,17 +2095,15 @@ async def download_presentation(update: Update, context: ContextTypes.DEFAULT_TY
 
     try:
         # Fetch index to get metadata
-        index_url = f"https://raw.githubusercontent.com/{PRESENTATIONS_GITHUB_REPO}/main/presentations_index.json"
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            index_response = await client.get(index_url)
+        index_content, _ = await _github_fetch_file("presentations_index.json")
 
         github_url = None
         topic = filename
         presenter = "Unknown"
         event_date = ""
 
-        if index_response.status_code == 200:
-            for pres in index_response.json():
+        if index_content:
+            for pres in json.loads(index_content):
                 if pres.get('file_name', '') == filename:
                     github_url = pres.get('github_url', '')
                     topic = pres.get('topic', filename)
@@ -2089,13 +2111,11 @@ async def download_presentation(update: Update, context: ContextTypes.DEFAULT_TY
                     event_date = pres.get('event_date', '')
                     break
 
-        if not github_url:
-            github_url = f"https://raw.githubusercontent.com/{PRESENTATIONS_GITHUB_REPO}/main/presentations/{filename}"
+        # Get file via API
+        filepath = f"presentations/{filename}"
+        file_bytes, status = await _github_fetch_file_bytes(filepath)
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(github_url)
-
-        if response.status_code != 200:
+        if status != 200 or not file_bytes:
             await query.message.reply_text("File not found on server.")
             return
 
@@ -2111,7 +2131,7 @@ async def download_presentation(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
         await query.message.reply_document(
-            document=response.content,
+            document=file_bytes,
             filename=display_name,
             caption=caption
         )
