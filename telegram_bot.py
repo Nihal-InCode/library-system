@@ -1902,28 +1902,57 @@ PRESENTATIONS_GITHUB_REPO = os.getenv("PRESENTATIONS_GITHUB_REPO", GITHUB_REPO)
 _PRESENTATIONS_CACHE = {}  # {user_id: [list of presentations]}
 
 async def _github_fetch_file(filepath):
-    """Fetch a file from GitHub via API (bypasses CDN cache of raw URLs)."""
+    """Fetch a file from GitHub via API with retry (bypasses CDN cache of raw URLs)."""
     api_url = f"https://api.github.com/repos/{PRESENTATIONS_GITHUB_REPO}/contents/{filepath}"
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(api_url)
-    if response.status_code == 200:
-        import base64
-        data = response.json()
-        content = base64.b64decode(data['content']).decode('utf-8')
-        return content, response.status_code
-    return None, response.status_code
+    headers = {}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.get(api_url, headers=headers)
+            if response.status_code == 200:
+                import base64
+                data = response.json()
+                content = base64.b64decode(data['content']).decode('utf-8')
+                return content, response.status_code
+            if response.status_code == 403:
+                # Rate limited — wait and retry
+                await asyncio.sleep(2)
+                continue
+            logger.error(f"GitHub API error for {filepath}: {response.status_code}")
+            return None, response.status_code
+        except Exception as e:
+            logger.error(f"GitHub API attempt {attempt+1} failed for {filepath}: {e}")
+            if attempt < 2:
+                await asyncio.sleep(1)
+    return None, 500
 
 async def _github_fetch_file_bytes(filepath):
-    """Fetch a file as bytes from GitHub via API (bypasses CDN cache)."""
+    """Fetch a file as bytes from GitHub via API with retry (bypasses CDN cache)."""
     api_url = f"https://api.github.com/repos/{PRESENTATIONS_GITHUB_REPO}/contents/{filepath}"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(api_url)
-    if response.status_code == 200:
-        import base64
-        data = response.json()
-        content = base64.b64decode(data['content'])
-        return content, response.status_code
-    return None, response.status_code
+    headers = {}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(api_url, headers=headers)
+            if response.status_code == 200:
+                import base64
+                data = response.json()
+                content = base64.b64decode(data['content'])
+                return content, response.status_code
+            if response.status_code == 403:
+                await asyncio.sleep(2)
+                continue
+            logger.error(f"GitHub API error for {filepath}: {response.status_code}")
+            return None, response.status_code
+        except Exception as e:
+            logger.error(f"GitHub API attempt {attempt+1} failed for {filepath}: {e}")
+            if attempt < 2:
+                await asyncio.sleep(1)
+    return None, 500
 
 async def cmd_presentations(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /presentations command."""
