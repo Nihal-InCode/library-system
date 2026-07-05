@@ -22,5 +22,13 @@
     "presenter": "KASIM",
     "event_date": "2026-07-05",
     "github_url": "https://raw.githubusercontent.com/Nihal-InCode/library-system/main/presentations/20260705_214747_BS4.pdf"
+  },
+  {
+    "id": 9,
+    "file_name": "timetable.pdf",
+    "topic": "Where Technology Meets Diversity",
+    "presenter": "NIHAL",
+    "event_date": "2026-07-05",
+    "github_url": "https://raw.githubusercontent.com/Nihal-InCode/library-system/main/presentations/20260705_223957_timetable.pdf"
   }
 ]
