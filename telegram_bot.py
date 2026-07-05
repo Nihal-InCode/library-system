@@ -2008,19 +2008,19 @@ async def handle_presentation_input(update: Update, context: ContextTypes.DEFAUL
 
     # Check if user typed a number
     if not text.isdigit():
-        await send_and_track_message(update, context, text="Please type a number (e.g. 1) to download, or type /menu to go back.")
+        await send_and_track_message(update, context, text="Please type a number (e.g. 1) to download, or type /menu to go back.", delay=3)
         return
 
     num = int(text)
     cache = _PRESENTATIONS_CACHE.get(user_id, [])
 
     if not cache:
-        await send_and_track_message(update, context, text="Session expired. Type /presentations to reload the list.")
+        await send_and_track_message(update, context, text="Session expired. Type /presentations to reload the list.", delay=3)
         set_user_state(user_id, CHOOSING)
         return
 
     if num < 1 or num > len(cache):
-        await send_and_track_message(update, context, text=f"Invalid number. Choose between 1 and {len(cache)}.")
+        await send_and_track_message(update, context, text=f"Invalid number. Choose between 1 and {len(cache)}.", delay=3)
         return
 
     pres = cache[num - 1]
@@ -2029,7 +2029,7 @@ async def handle_presentation_input(update: Update, context: ContextTypes.DEFAUL
     presenter = pres.get('presenter', 'Unknown')
 
     # Send loading message
-    loading_msg = await send_and_track_message(update, context, text=f"Downloading: {topic}...")
+    loading_msg = await send_and_track_message(update, context, text=f"Downloading: {topic}...", delay=3)
 
     try:
         github_url = pres.get('github_url', '')
