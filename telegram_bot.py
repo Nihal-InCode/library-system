@@ -2050,7 +2050,8 @@ async def handle_presentation_input(update: Update, context: ContextTypes.DEFAUL
             f"📎 {topic}\n\n"
             f"By: {presenter}\n"
             f"Date: {pres.get('event_date', '')}\n\n"
-            f"Downloaded from Markhins Central Library"
+            f"——————————————\n"
+            f"© Markhins Central Library"
         )
 
         await update.message.reply_document(
@@ -2105,7 +2106,8 @@ async def download_presentation(update: Update, context: ContextTypes.DEFAULT_TY
             f"📎 {topic}\n\n"
             f"By: {presenter}\n"
             f"Date: {event_date}\n\n"
-            f"Downloaded from Markhins Central Library"
+            f"——————————————\n"
+            f"© Markhins Central Library"
         )
 
         await query.message.reply_document(
