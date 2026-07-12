@@ -5,10 +5,14 @@ import os
 
 def start_flask():
     """Start Flask backend in a background thread."""
-    from brain import app, init_db, IMAGES_DIR
+    from brain import app, init_db, IMAGES_DIR, restore_db_from_github
     import logging
 
     logger = logging.getLogger(__name__)
+
+    # Restore DB from GitHub Releases if missing (Railway ephemeral storage)
+    restore_db_from_github()
+
     init_db()
 
     if not os.path.exists(IMAGES_DIR):

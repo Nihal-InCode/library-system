@@ -8,10 +8,14 @@ from typing import Set, Dict, Any, List, Tuple
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import base64
+import requests as _req
 
 # --- CONFIGURATION ---
 DB_PATH = "islamic_library.db"
 IMAGES_DIR = "images"
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITHUB_REPO = "Nihal-InCode/library-system"
+DB_RELEASE_TAG = "db-backup-latest"
 
 # --- LOGGING ---
 logging.basicConfig(
@@ -53,6 +57,124 @@ def get_student_image_base64(student_id: str) -> str:
 # --- FLASK APP ---
 app = Flask(__name__)
 CORS(app)
+
+# --- GITHUB RELEASES BACKUP / RESTORE ---
+
+def backup_db_to_github():
+    """Push the current DB to a GitHub Release (does NOT trigger Railway webhooks)."""
+    if not GITHUB_TOKEN:
+        logger.warning("GITHUB_TOKEN not set — DB backup to GitHub skipped")
+        return False
+    if not os.path.exists(DB_PATH) or os.path.getsize(DB_PATH) == 0:
+        logger.warning("DB file missing or empty — backup skipped")
+        return False
+
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+    api = f"https://api.github.com/repos/{GITHUB_REPO}"
+
+    try:
+        # 1. Get HEAD sha (needed to create a lightweight tag)
+        r = _req.get(f"{api}/git/refs/heads/main", headers=headers, timeout=10)
+        if r.status_code != 200:
+            logger.error(f"backup_db: can't get HEAD sha: {r.status_code}")
+            return False
+        head_sha = r.json()["object"]["sha"]
+
+        # 2. Delete old release + tag if they exist
+        r = _req.get(f"{api}/releases/tags/{DB_RELEASE_TAG}", headers=headers, timeout=10)
+        if r.status_code == 200:
+            rel = r.json()
+            for asset in rel.get("assets", []):
+                _req.delete(f"{api}/releases/assets/{asset['id']}", headers=headers, timeout=10)
+            _req.delete(f"{api}/releases/{rel['id']}", headers=headers, timeout=10)
+        _req.delete(f"{api}/git/refs/tags/{DB_RELEASE_TAG}", headers=headers, timeout=10)
+
+        # 3. Create lightweight tag pointing to HEAD
+        _req.post(f"{api}/git/refs", json={
+            "ref": f"refs/tags/{DB_RELEASE_TAG}",
+            "sha": head_sha,
+        }, headers=headers, timeout=10)
+
+        # 4. Create a new release
+        r = _req.post(f"{api}/releases", json={
+            "tag_name": DB_RELEASE_TAG,
+            "name": "Database Backup",
+            "body": f"Auto-backup at {datetime.now().isoformat()}",
+            "draft": False,
+            "prerelease": False,
+        }, headers=headers, timeout=10)
+        if r.status_code not in (200, 201):
+            logger.error(f"backup_db: can't create release: {r.status_code} {r.text[:200]}")
+            return False
+
+        release = r.json()
+        upload_tpl = release["upload_url"]  # {...?name,label}
+
+        # 5. Upload the .db file as a release asset
+        with open(DB_PATH, "rb") as fh:
+            db_bytes = fh.read()
+
+        asset_url = upload_tpl.replace("{?name,label}", f"?name={DB_PATH}")
+        r = _req.post(
+            asset_url,
+            data=db_bytes,
+            headers={
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Content-Type": "application/octet-stream",
+            },
+            timeout=120,
+        )
+        if r.status_code in (200, 201):
+            logger.info(f"Database backed up to GitHub Release ({len(db_bytes)} bytes)")
+            return True
+        logger.error(f"backup_db: upload failed: {r.status_code}")
+        return False
+    except Exception as e:
+        logger.error(f"backup_db exception: {e}")
+        return False
+
+
+def restore_db_from_github():
+    """Download the DB from GitHub Releases if the local file is missing/empty."""
+    if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 1024:
+        logger.info("Database already exists locally — skipping restore")
+        return True
+    if not GITHUB_TOKEN:
+        logger.warning("GITHUB_TOKEN not set — cannot restore DB from GitHub")
+        return False
+
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+    api = f"https://api.github.com/repos/{GITHUB_REPO}"
+
+    try:
+        r = _req.get(f"{api}/releases/tags/{DB_RELEASE_TAG}", headers=headers, timeout=10)
+        if r.status_code != 200:
+            logger.warning(f"No DB backup found on GitHub (status {r.status_code})")
+            return False
+
+        assets = r.json().get("assets", [])
+        if not assets:
+            logger.warning("DB backup release has no assets")
+            return False
+
+        dl_url = assets[0]["browser_download_url"]
+        r = _req.get(dl_url, headers=headers, timeout=120)
+        if r.status_code == 200:
+            with open(DB_PATH, "wb") as fh:
+                fh.write(r.content)
+            logger.info(f"Database restored from GitHub Release ({len(r.content)} bytes)")
+            return True
+        logger.error(f"restore_db: download failed: {r.status_code}")
+        return False
+    except Exception as e:
+        logger.error(f"restore_db exception: {e}")
+        return False
 
 # --- ENDPOINTS ---
 

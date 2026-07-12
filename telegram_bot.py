@@ -25,6 +25,9 @@ from telegram.constants import ChatAction
 # Import shared Telegram utilities
 from telegram_utils import get_bot_token, get_admin_chat_id
 
+# DB backup/restore (from brain module)
+from brain import backup_db_to_github
+
 # --- CONFIGURATION ---
 TOKEN = get_bot_token()
 ADMIN_CHAT_ID = get_admin_chat_id()
@@ -749,6 +752,7 @@ async def show_admin_db_tools(update: Update, context: ContextTypes.DEFAULT_TYPE
     keyboard = [
         [InlineKeyboardButton("⬇️ Download Database", callback_data="admin_export")],
         [InlineKeyboardButton("📤 Upload Database", callback_data="admin_import_info")],
+        [InlineKeyboardButton("☁️ Backup to Cloud", callback_data="admin_backup")],
         [InlineKeyboardButton("🔙 Back", callback_data="admin_dash")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -756,7 +760,8 @@ async def show_admin_db_tools(update: Update, context: ContextTypes.DEFAULT_TYPE
         "🗄 *Database*\n"
         "━━━━━━━━━━━━━━━\n"
         "⬇️ *Download* — Export current database\n"
-        "📤 *Upload* — Send a `.db` file to auto-import"
+        "📤 *Upload* — Send a `.db` file to auto-import\n"
+        "☁️ *Backup* — Save to cloud (survives restarts)"
     )
     
     if update.callback_query:
@@ -1188,6 +1193,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_db_export(update, context)
         elif data == "admin_import_info":
             await query.answer("💡 Just send a .db file in chat — it auto-imports!", show_alert=True)
+        elif data == "admin_backup":
+            await handle_db_backup(update, context)
         elif data == "page_user_list":
             USER_PAGINATION_CONTEXT[user_id] = {"page": 1}
             await send_bot_users_page(update, context, user_id, 1)
@@ -1766,6 +1773,33 @@ async def handle_db_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error exporting database: {e}")
         await send_and_track_message(update, context, text="⚠️ *Error*\n\nFailed to export database.")
 
+async def handle_db_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Backup the database to GitHub Releases (cloud backup)."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+
+    await update.callback_query.answer("☁️ Backing up to cloud...")
+    await send_and_track_message(update, context, text="☁️ *Backing Up Database*\n\nUploading to cloud storage...")
+
+    try:
+        import threading
+        result = [None]
+        def _do_backup():
+            result[0] = backup_db_to_github()
+        t = threading.Thread(target=_do_backup)
+        t.start()
+        t.join(timeout=120)
+
+        if result[0]:
+            await send_and_track_message(update, context, text="✅ *Backup Complete*\n\nDatabase has been backed up to cloud storage.\nData will survive server restarts.")
+            await log_admin_action(user_id, "DB_BACKUP", details="Manual cloud backup")
+        else:
+            await send_and_track_message(update, context, text="⚠️ *Backup Failed*\n\nCould not backup to cloud. Check that GITHUB_TOKEN is set.")
+    except Exception as e:
+        logger.error(f"DB backup error: {e}")
+        await send_and_track_message(update, context, text="⚠️ *Backup Failed*\n\nAn error occurred during backup.")
+
 async def handle_db_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Processes the uploaded database file. Admin-only, auto-imports instantly."""
     user_id = update.effective_user.id
@@ -1813,6 +1847,12 @@ async def handle_db_file_upload(update: Update, context: ContextTypes.DEFAULT_TY
             await send_and_track_message(update, context, text="✅ *Import Complete*\n\nDatabase has been replaced successfully.\nLibrary data has been updated.")
             await log_admin_action(user_id, "DB_IMPORT", details=f"File: {doc.file_name}, Size: {doc.file_size}")
             set_user_state(user_id, CHOOSING)
+            # Auto-backup to GitHub Releases so data survives Railway restarts
+            try:
+                import threading
+                threading.Thread(target=backup_db_to_github, daemon=True).start()
+            except Exception as be:
+                logger.error(f"DB auto-backup failed: {be}")
         except Exception as e:
             # Rollback
             if os.path.exists(backup_path):
@@ -1930,20 +1970,36 @@ async def _github_fetch_file(filepath):
     return None, 500
 
 async def _github_fetch_file_bytes(filepath):
-    """Fetch a file as bytes from GitHub via API with retry (bypasses CDN cache)."""
+    """Fetch a file as bytes from GitHub via API with retry (bypasses CDN cache).
+
+    For files >1MB the Contents API omits the base64 ``content`` field.
+    In that case we fall back to the ``download_url`` (raw.githubusercontent.com).
+    """
     api_url = f"https://api.github.com/repos/{PRESENTATIONS_GITHUB_REPO}/contents/{filepath}"
     headers = {}
     if GITHUB_TOKEN:
         headers["Authorization"] = f"token {GITHUB_TOKEN}"
     for attempt in range(3):
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=60.0) as client:
                 response = await client.get(api_url, headers=headers)
             if response.status_code == 200:
-                import base64
                 data = response.json()
-                content = base64.b64decode(data['content'])
-                return content, response.status_code
+                # Small file — base64 content is returned inline
+                if "content" in data and data.get("encoding") != "none":
+                    content = base64.b64decode(data["content"])
+                    return content, 200
+                # Large file (>1MB) — use download_url instead
+                if "download_url" in data:
+                    dl_url = data["download_url"]
+                    async with httpx.AsyncClient(timeout=60.0) as dl_client:
+                        dl_resp = await dl_client.get(dl_url, headers=headers)
+                    if dl_resp.status_code == 200:
+                        return dl_resp.content, 200
+                    logger.error(f"download_url fetch failed: {dl_resp.status_code}")
+                    return None, dl_resp.status_code
+                logger.error(f"No content or download_url for {filepath}")
+                return None, 200
             if response.status_code == 403:
                 await asyncio.sleep(2)
                 continue
