@@ -754,7 +754,7 @@ def _external_query_db(query, params=()):
 # All transactions that are still out (used by stats / status / overdue)
 _OPEN_TX_QUERY = """
     SELECT t.id, t.book_id, t.member_id, t.issue_date, t.due_date, t.status, t.return_date,
-           b.title, m.name, m.batch
+           b.title, m.name, m.batch, t.librarian
     FROM transactions t
     LEFT JOIN books b ON b.id = t.book_id
     LEFT JOIN members m ON m.student_id = t.member_id
@@ -847,7 +847,7 @@ def _load_open_transactions():
     records = []
     for row in rows:
         (tid, book_id, member_id, issue_date, due_date, status, return_date,
-         title, member_name, batch) = row
+         title, member_name, batch, librarian) = row
         records.append({
             "transaction_id": tid,
             "book_id": book_id,
@@ -855,6 +855,7 @@ def _load_open_transactions():
             "member_id": member_id,
             "member_name": member_name or "Unknown",
             "member_batch": batch,
+            "librarian": librarian,
             "issue_date": issue_date,
             "due_date": due_date,
             "overdue": is_overdue_transaction(due_date, status, return_date),
@@ -1010,6 +1011,7 @@ def external_books():
         books = []
         for book_id, title, author, category_val, total, available, shelf, row, area in rows:
             is_overdue_book = book_id in overdue_ids
+            active_issues = [rec for rec in open_records if rec["book_id"] == book_id]
             books.append({
                 "id": book_id,
                 "title": title,
@@ -1020,6 +1022,10 @@ def external_books():
                 "currently_issued_copies": open_counts.get(book_id, 0),
                 "status": "available" if (available or 0) > 0 else "issued",
                 "overdue": is_overdue_book,
+                "active_issues": [
+                    {k: v for k, v in issue.items() if k != "_due"}
+                    for issue in active_issues
+                ],
                 "shelf": shelf,
                 "row": row,
                 "area": area,
@@ -1111,6 +1117,7 @@ def external_books_status():
                     "member_id": holder[2],
                     "member_name": holder[8] or "Unknown",
                     "member_batch": holder[9],
+                    "librarian": holder[10],
                     "issue_date": holder[3],
                     "due_date": holder[4],
                 }
