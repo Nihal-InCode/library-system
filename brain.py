@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import asyncio
+import hmac
 import logging
 from datetime import datetime
 import time
@@ -10,7 +11,9 @@ from flask_cors import CORS
 import base64
 
 # --- CONFIGURATION ---
-DB_PATH = "islamic_library.db"
+# Railway (production) sets LIBRARY_DB_PATH=/data/islamic_library.db so Flask and the
+# Telegram bot share the same persistent volume. Local/dev falls back to the repo file.
+DB_PATH = os.environ.get("LIBRARY_DB_PATH", "").strip() or "islamic_library.db"
 IMAGES_DIR = "images"
 
 # --- LOGGING ---
@@ -19,6 +22,15 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Never fall back to the repo copy SILENTLY on Railway: if the volume variable is
+# missing, shout about it in the logs (still starts, so an existing deployment keeps working).
+IS_RAILWAY = any(
+    os.environ.get(v) for v in ("RAILWAY_ENVIRONMENT", "RAILWAY_PROJECT_ID", "RAILWAY_SERVICE_NAME")
+)
+if IS_RAILWAY and not os.environ.get("LIBRARY_DB_PATH", "").strip():
+    raise RuntimeError("LIBRARY_DB_PATH must be configured on Railway; refusing to use a local database copy")
+
 def get_db_connection():
     """Create a new SQLite connection for each request."""
     return sqlite3.connect(DB_PATH, timeout=10)
@@ -723,6 +735,655 @@ def get_admin_actions():
     except Exception as e:
         logger.error(f"Error getting admin actions: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
+
+# ============================================================
+# --- EXTERNAL READ-ONLY API (Attendance integration) ---
+# Auth: X-API-Key header compared against the LIBRARY_API_KEY env var.
+# GET-only. The Telegram bot talks to brain.py over localhost on the
+# legacy routes, so it is NOT affected by this guard.
+# ============================================================
+EXTERNAL_API_PREFIX = "/api/external/"
+def _external_query_db(query, params=()):
+    """Execute an external API SELECT and fail visibly instead of masking DB errors as empty data."""
+    conn = get_db_connection()
+    try:
+        return conn.execute(query, params).fetchall()
+    finally:
+        conn.close()
+
+# All transactions that are still out (used by stats / status / overdue)
+_OPEN_TX_QUERY = """
+    SELECT t.id, t.book_id, t.member_id, t.issue_date, t.due_date, t.status, t.return_date,
+           b.title, m.name, m.batch
+    FROM transactions t
+    LEFT JOIN books b ON b.id = t.book_id
+    LEFT JOIN members m ON m.student_id = t.member_id
+    WHERE t.status = 'issued' AND t.return_date IS NULL
+"""
+
+
+@app.before_request
+def guard_external_api():
+    """Require a valid X-API-Key on /api/external/* only."""
+    if not request.path.startswith(EXTERNAL_API_PREFIX):
+        return None
+    configured_key = os.environ.get("LIBRARY_API_KEY", "").strip()
+    if not configured_key:
+        # Fail closed: never serve external data without a configured secret.
+        logger.warning("External API request blocked: LIBRARY_API_KEY is not configured")
+        return jsonify({"status": "error", "message": "External API is disabled"}), 503
+    provided_key = request.headers.get("X-API-Key", "").strip()
+    if not provided_key or not hmac.compare_digest(provided_key.encode("utf-8"), configured_key.encode("utf-8")):
+        # Never log the provided key - only the route that was rejected.
+        logger.warning("External API unauthorized: %s %s", request.method, request.path)
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+    return None
+
+
+# --- EXTERNAL API HELPERS ---
+DATE_FORMATS = (
+    "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+    "%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M", "%d-%m-%Y",
+    "%d/%m/%Y",
+)
+
+
+def parse_date(value):
+    """Parse any date/datetime string used across the project.
+    Returns a datetime, or None for NULL / empty / unrecognised values."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    for fmt in DATE_FORMATS:
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def is_open_transaction(status, return_date) -> bool:
+    """Currently out on loan: status='issued' and no return date."""
+    return str(status or "").strip().lower() == "issued" and not str(return_date or "").strip()
+
+
+def is_overdue_transaction(due_date, status, return_date) -> bool:
+    """True only when the item is still out AND due_date parses AND it is past due.
+    NULL / empty / unparseable due dates are NEVER treated as overdue."""
+    if not is_open_transaction(status, return_date):
+        return False
+    due = parse_date(due_date)
+    if due is None:
+        return False
+    return due < datetime.now()
+
+
+def _int_arg(name, default, min_value=None, max_value=None):
+    """Read an integer query parameter, clamped to a safe range."""
+    raw = request.args.get(name, None)
+    try:
+        value = int(str(raw).strip()) if raw is not None else default
+    except (TypeError, ValueError):
+        value = default
+    if min_value is not None and value < min_value:
+        value = min_value
+    if max_value is not None and value > max_value:
+        value = max_value
+    return value
+
+
+def _like_escape(term: str) -> str:
+    """Escape LIKE wildcards supplied by the client."""
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _load_open_transactions():
+    """Rows of _OPEN_TX_QUERY plus computed overdue flag, sorted overdue-first."""
+    rows = _external_query_db(_OPEN_TX_QUERY)
+    records = []
+    for row in rows:
+        (tid, book_id, member_id, issue_date, due_date, status, return_date,
+         title, member_name, batch) = row
+        records.append({
+            "transaction_id": tid,
+            "book_id": book_id,
+            "book_title": title or "Unknown",
+            "member_id": member_id,
+            "member_name": member_name or "Unknown",
+            "member_batch": batch,
+            "issue_date": issue_date,
+            "due_date": due_date,
+            "overdue": is_overdue_transaction(due_date, status, return_date),
+            "_due": parse_date(due_date),
+        })
+    # Overdue first, then earliest due date (NULL due dates last)
+    records.sort(key=lambda r: (0 if r["overdue"] else 1, r["_due"] or datetime.max, str(r["issue_date"] or "")))
+    return records
+
+
+# --- EXTERNAL ENDPOINT 1: STATISTICS ---
+@app.route('/api/external/library/stats', methods=['GET'])
+def external_library_stats():
+    """Library-wide statistics + currently issued list."""
+    try:
+        now = datetime.now()
+        today = now.date()
+
+        totals = _external_query_db("""
+            SELECT COUNT(*),
+                   COALESCE(SUM(total_copies), 0),
+                   COALESCE(SUM(available_copies), 0)
+            FROM books
+        """)
+        total_titles, total_copies, available_copies = totals[0] if totals else (0, 0, 0)
+
+        member_rows = _external_query_db("SELECT COUNT(*) FROM members")
+        registered_members = member_rows[0][0] if member_rows else 0
+
+        open_records = _load_open_transactions()
+
+        issues_today = 0
+        for (value,) in _external_query_db("SELECT issue_date FROM transactions WHERE issue_date IS NOT NULL"):
+            parsed = parse_date(value)
+            if parsed is not None and parsed.date() == today:
+                issues_today += 1
+
+        returns_today = 0
+        for (value,) in _external_query_db("SELECT return_date FROM transactions WHERE return_date IS NOT NULL"):
+            parsed = parse_date(value)
+            if parsed is not None and parsed.date() == today:
+                returns_today += 1
+
+        issued_list = [{k: v for k, v in rec.items() if k != "_due"} for rec in open_records[:50]]
+        overdue_count = sum(1 for rec in open_records if rec["overdue"])
+
+        return jsonify({
+            "status": "ok",
+            "data": {
+                "total_titles": total_titles,
+                "total_copies": total_copies,
+                "available_copies": available_copies,
+                "currently_issued": len(open_records),
+                "currently_issued_titles": len({r["book_id"] for r in open_records}),
+                "overdue_books": overdue_count,
+                "registered_members": registered_members,
+                "issues_today": issues_today,
+                "returns_today": returns_today,
+                "currently_issued_list": issued_list,
+                "currently_issued_list_count": len(issued_list),
+                "last_updated": now.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        })
+    except Exception as e:
+        logger.error(f"Error in external_library_stats: {e}")
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
+
+
+# --- EXTERNAL ENDPOINT 2: BOOK SEARCH ---
+@app.route('/api/external/library/books', methods=['GET'])
+def external_books():
+    """Search books by id / title / author / category with pagination and filters."""
+    try:
+        term = (request.args.get('q') or request.args.get('term') or '').strip()
+        page = _int_arg('page', 1, min_value=1)
+        page_size = _int_arg('page_size', 20, min_value=1, max_value=100)
+        status_filter = (request.args.get('status') or '').strip().lower()
+        category = (request.args.get('category') or '').strip()
+
+        # Book IDs with open transactions (computed once).
+        open_records = _load_open_transactions()
+        open_counts = {}
+        overdue_book_ids = set()
+        for rec in open_records:
+            open_counts[rec["book_id"]] = open_counts.get(rec["book_id"], 0) + 1
+            if rec["overdue"]:
+                overdue_book_ids.add(rec["book_id"])
+        open_book_ids = set(open_counts)
+
+        conditions = []
+        params = []
+
+        if term:
+            like = f"%{_like_escape(term)}%"
+            conditions.append(
+                "(LOWER(b.id) = LOWER(?)"
+                " OR LOWER(b.id) LIKE ? ESCAPE '\\'"
+                " OR LOWER(b.title) LIKE ? ESCAPE '\\'"
+                " OR LOWER(COALESCE(b.author, '')) LIKE ? ESCAPE '\\'"
+                " OR LOWER(COALESCE(b.category, '')) LIKE ? ESCAPE '\\'"
+                " OR LOWER(COALESCE(b.shelf, '')) LIKE ? ESCAPE '\\'"
+                " OR LOWER(COALESCE(b.row, '')) LIKE ? ESCAPE '\\'"
+                " OR LOWER(COALESCE(b.area, '')) LIKE ? ESCAPE '\\')"
+            )
+            params.extend([term, like, like, like, like, like, like, like])
+
+        if category:
+            conditions.append("LOWER(COALESCE(b.category, '')) = LOWER(?)")
+            params.append(category)
+
+        if status_filter == "available":
+            conditions.append("b.available_copies > 0")
+        elif status_filter == "issued":
+            if open_book_ids:
+                ordered_open_ids = sorted(open_book_ids)
+                conditions.append("b.id IN (%s)" % ",".join("?" * len(ordered_open_ids)))
+                params.extend(ordered_open_ids)
+            else:
+                conditions.append("1 = 0")
+        elif status_filter == "overdue":
+            if overdue_book_ids:
+                ordered_overdue_ids = sorted(overdue_book_ids)
+                conditions.append("b.id IN (%s)" % ",".join("?" * len(ordered_overdue_ids)))
+                params.extend(ordered_overdue_ids)
+            else:
+                conditions.append("1 = 0")
+        elif status_filter:
+            return jsonify({
+                "status": "error",
+                "message": "Invalid status filter. Use: available, issued or overdue."
+            }), 400
+
+        where_sql = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        count_rows = _external_query_db(f"SELECT COUNT(*) FROM books b{where_sql}", tuple(params))
+        total_count = count_rows[0][0] if count_rows else 0
+
+        data_params = list(params) + [page_size, (page - 1) * page_size]
+        rows = _external_query_db(
+            f"""
+            SELECT b.id, b.title, b.author, b.category,
+                   b.total_copies, b.available_copies, b.shelf, b.row, b.area
+            FROM books b
+            {where_sql}
+            ORDER BY b.title COLLATE NOCASE ASC, b.id ASC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(data_params),
+        )
+
+        overdue_ids = overdue_book_ids
+
+        books = []
+        for book_id, title, author, category_val, total, available, shelf, row, area in rows:
+            is_overdue_book = book_id in overdue_ids
+            books.append({
+                "id": book_id,
+                "title": title,
+                "author": author or "N/A",
+                "category": category_val or "N/A",
+                "total_copies": total if total is not None else 0,
+                "available_copies": available if available is not None else 0,
+                "currently_issued_copies": open_counts.get(book_id, 0),
+                "status": "available" if (available or 0) > 0 else "issued",
+                "overdue": is_overdue_book,
+                "shelf": shelf,
+                "row": row,
+                "area": area,
+            })
+
+        total_pages = (total_count + page_size - 1) // page_size if total_count > 0 else 1
+
+        return jsonify({
+            "status": "ok",
+            "data": {
+                "books": books,
+                "count": len(books),
+                "total_count": total_count,
+                "total_pages": total_pages,
+                "current_page": page,
+                "page_size": page_size,
+            }
+        })
+    except Exception as e:
+        logger.error(f"Error in external_books: {e}")
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
+
+
+# --- EXTERNAL ENDPOINT 3: CATEGORIES ---
+@app.route('/api/external/library/books/categories', methods=['GET'])
+def external_book_categories():
+    """Distinct book categories with counts."""
+    try:
+        rows = _external_query_db("""
+            SELECT CASE WHEN category IS NULL OR TRIM(category) = ''
+                        THEN 'Uncategorized' ELSE TRIM(category) END AS cat,
+                   COUNT(*),
+                   COALESCE(SUM(total_copies), 0),
+                   COALESCE(SUM(available_copies), 0)
+            FROM books
+            GROUP BY cat
+            ORDER BY cat COLLATE NOCASE ASC
+        """)
+        categories = [
+            {"category": cat, "titles": titles, "total_copies": copies, "available_copies": available}
+            for cat, titles, copies, available in rows
+        ]
+        return jsonify({
+            "status": "ok",
+            "data": {"categories": categories, "total_count": len(categories)}
+        })
+    except Exception as e:
+        logger.error(f"Error in external_book_categories: {e}")
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
+
+
+# --- EXTERNAL ENDPOINT 4: BOOK STATUS ---
+@app.route('/api/external/library/books/status', methods=['GET'])
+def external_books_status():
+    """Availability summary, or the status of one book (?book_id=...)."""
+    try:
+        book_id = (request.args.get('book_id') or '').strip()
+        include_holder = (request.args.get('include_holder') or '').strip().lower() in ("1", "true", "yes")
+
+        if book_id:
+            rows = _external_query_db(
+                "SELECT id, title, author, category, total_copies, available_copies "
+                "FROM books WHERE id = ? COLLATE NOCASE",
+                (book_id,),
+            )
+            if not rows:
+                return jsonify({"status": "error", "message": "Book not found"}), 404
+            book_id, title, author, category, total, available = rows[0]
+
+            open_rows = _external_query_db(_OPEN_TX_QUERY + " AND t.book_id = ? COLLATE NOCASE ORDER BY t.issue_date DESC",
+                                 (book_id,))
+            overdue = any(is_overdue_transaction(r[4], r[5], r[6]) for r in open_rows)
+
+            data = {
+                "id": book_id,
+                "title": title,
+                "author": author or "N/A",
+                "category": category or "N/A",
+                "total_copies": total if total is not None else 0,
+                "available_copies": available if available is not None else 0,
+                "status": "available" if (available or 0) > 0 else "issued",
+                "overdue": overdue,
+                "open_copies": len(open_rows),
+            }
+
+            if include_holder and open_rows:
+                holder = open_rows[0]  # (tid, book_id, member_id, issue, due, status, ret, title, name, batch)
+                data["current_holder"] = {
+                    "member_id": holder[2],
+                    "member_name": holder[8] or "Unknown",
+                    "member_batch": holder[9],
+                    "issue_date": holder[3],
+                    "due_date": holder[4],
+                }
+
+            return jsonify({"status": "ok", "data": data})
+
+        # Aggregate view
+        totals = _external_query_db("""
+            SELECT COUNT(*),
+                   SUM(CASE WHEN available_copies > 0 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN available_copies <= 0 THEN 1 ELSE 0 END)
+            FROM books
+        """)
+        total_titles, available_titles, issued_titles = totals[0] if totals else (0, 0, 0)
+
+        open_records = _load_open_transactions()
+        return jsonify({
+            "status": "ok",
+            "data": {
+                "total_titles": total_titles,
+                "available_titles": available_titles or 0,
+                "issued_titles": issued_titles or 0,
+                "open_copies": len(open_records),
+                "overdue_copies": sum(1 for r in open_records if r["overdue"]),
+                "open_without_due_date": sum(1 for r in open_records if r["_due"] is None),
+                "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        })
+    except Exception as e:
+        logger.error(f"Error in external_books_status: {e}")
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
+
+
+# --- EXTERNAL ENDPOINT 5: MEMBER SEARCH ---
+@app.route('/api/external/library/members/search', methods=['GET'])
+def external_member_search():
+    """Search members by student ID or name. Returns minimal profile data only."""
+    try:
+        term = (request.args.get('q') or request.args.get('term') or '').strip()
+        limit = _int_arg('limit', 20, min_value=1, max_value=100)
+
+        if not term:
+            return jsonify({
+                "status": "ok",
+                "data": {"members": [], "total_count": 0, "message": "Empty search term"}
+            })
+
+        like = f"%{_like_escape(term)}%"
+        count_rows = _external_query_db(
+            "SELECT COUNT(*) FROM members "
+            "WHERE LOWER(student_id) LIKE ? ESCAPE '\\' OR LOWER(name) LIKE ? ESCAPE '\\'",
+            (like, like),
+        )
+        total_count = count_rows[0][0] if count_rows else 0
+
+        rows = _external_query_db(
+            """
+            SELECT student_id, name, batch, type
+            FROM members
+            WHERE LOWER(student_id) LIKE ? ESCAPE '\\' OR LOWER(name) LIKE ? ESCAPE '\\'
+            ORDER BY CASE WHEN LOWER(student_id) = LOWER(?) THEN 0 ELSE 1 END,
+                     name COLLATE NOCASE ASC
+            LIMIT ?
+            """,
+            (like, like, term, limit),
+        )
+
+        members = [
+            {"student_id": sid, "name": name, "batch": batch, "type": mtype or "student"}
+            for sid, name, batch, mtype in rows
+        ]
+        return jsonify({
+            "status": "ok",
+            "data": {"members": members, "count": len(members), "total_count": total_count}
+        })
+    except Exception as e:
+        logger.error(f"Error in external_member_search: {e}")
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
+
+
+# --- EXTERNAL ENDPOINT 6: MEMBER HISTORY ---
+@app.route('/api/external/library/members/<string:student_id>/history', methods=['GET'])
+def external_member_history(student_id):
+    """Borrowing summary + complete issue/return history for one member."""
+    try:
+        student_id = (student_id or "").strip()
+        member = _external_query_db(
+            "SELECT student_id, name, batch, type FROM members WHERE student_id = ? COLLATE NOCASE",
+            (student_id,),
+        )
+        if not member:
+            return jsonify({"status": "error", "message": "Member not found"}), 404
+
+        sid, name, batch, mtype = member[0]
+
+        rows = _external_query_db(
+            """
+            SELECT t.id, t.book_id, t.issue_date, t.due_date, t.return_date, t.status,
+                   b.title, b.author
+            FROM transactions t
+            LEFT JOIN books b ON b.id = t.book_id
+            WHERE t.member_id = ? COLLATE NOCASE
+            ORDER BY t.id DESC
+            """,
+            (sid,),
+        )
+
+        history_items = []
+        held_items = []
+        held_count = 0
+        overdue_count = 0
+        for tid, book_id, issue_date, due_date, return_date, status, title, author in rows:
+            open_tx = is_open_transaction(status, return_date)
+            overdue = is_overdue_transaction(due_date, status, return_date)
+            item = {
+                "transaction_id": tid,
+                "book_id": book_id,
+                "book_title": title or "Unknown",
+                "book_author": author or "N/A",
+                "issue_date": issue_date,
+                "due_date": due_date,
+                "return_date": return_date,
+                "status": status or "",
+                "state": "held" if open_tx else "returned",
+                "is_overdue": overdue,
+            }
+            if open_tx:
+                held_count += 1
+                if overdue:
+                    overdue_count += 1
+                held_items.append(item)
+            history_items.append(item)
+
+        borrowed_count = len(history_items)
+        returned_count = borrowed_count - held_count
+
+        # Pagination is optional. Without it, return the complete history.
+        page_raw = request.args.get('page')
+        page_size_raw = request.args.get('page_size')
+        if page_raw is None and page_size_raw is None:
+            page, page_size = 1, max(len(history_items), 1)
+        else:
+            page = _int_arg('page', 1, min_value=1)
+            page_size = _int_arg('page_size', 100, min_value=1, max_value=500)
+
+        total_count = len(history_items)
+        total_pages = (total_count + page_size - 1) // page_size if total_count > 0 else 1
+        start = (page - 1) * page_size
+        page_items = history_items[start:start + page_size]
+
+        data = {
+            "student_id": sid,
+            "name": name,
+            "batch": batch,
+            "type": mtype or "student",
+            "summary": {
+                "borrowed_count": borrowed_count,
+                "returned_count": returned_count,
+                "currently_held_count": held_count,
+                "overdue_count": overdue_count,
+            },
+            "currently_held": held_items,
+            "history": page_items,
+            "total_count": total_count,
+            "total_pages": total_pages,
+            "current_page": page,
+            "page_size": page_size,
+            "truncated": False,
+        }
+        return jsonify({"status": "ok", "data": data})
+    except Exception as e:
+        logger.error(f"Error in external_member_history: {e}")
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
+
+
+# --- EXTERNAL ENDPOINT 7: RECENT ACTIVITY ---
+@app.route('/api/external/library/transactions/recent', methods=['GET'])
+def external_recent_transactions():
+    """Latest issue and return events (newest first)."""
+    try:
+        limit = _int_arg('limit', 20, min_value=1, max_value=100)
+
+        rows = _external_query_db("""
+            SELECT t.id, t.book_id, t.member_id, t.issue_date, t.due_date, t.return_date, t.status,
+                   b.title, m.name
+            FROM transactions t
+            LEFT JOIN books b ON b.id = t.book_id
+            LEFT JOIN members m ON m.student_id = t.member_id
+            ORDER BY t.id DESC
+            LIMIT 500
+        """)
+
+        events = []
+        for tid, book_id, member_id, issue_date, due_date, return_date, status, title, member_name in rows:
+            returned = bool(str(return_date or "").strip()) or str(status or "").strip().lower() == "returned"
+            activity_raw = return_date if returned else issue_date
+            events.append((
+                parse_date(activity_raw) or datetime.min,
+                tid or 0,
+                {
+                    "transaction_id": tid,
+                    "event": "return" if returned else "issue",
+                    "activity_date": activity_raw,
+                    "book": {"id": book_id, "title": title or "Unknown"},
+                    "member": {"student_id": member_id, "name": member_name or "Unknown"},
+                    "issue_date": issue_date,
+                    "due_date": due_date,
+                    "return_date": return_date,
+                    "status": status or "",
+                },
+            ))
+
+        events.sort(key=lambda e: (e[0], e[1]), reverse=True)
+        items = [e[2] for e in events[:limit]]
+
+        return jsonify({
+            "status": "ok",
+            "data": {"items": items, "count": len(items), "limit": limit}
+        })
+    except Exception as e:
+        logger.error(f"Error in external_recent_transactions: {e}")
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
+
+
+# --- EXTERNAL ENDPOINT 8: OVERDUE ---
+@app.route('/api/external/library/transactions/overdue', methods=['GET'])
+def external_overdue_transactions():
+    """Open (never returned) transactions past their due date.
+    NULL / unparseable due dates are reported separately, never counted as overdue."""
+    try:
+        page = _int_arg('page', 1, min_value=1)
+        page_size = _int_arg('page_size', 20, min_value=1, max_value=100)
+        now = datetime.now()
+
+        overdue_all = []
+        missing_due = 0
+        for rec in _load_open_transactions():
+            if rec["_due"] is None:
+                missing_due += 1
+                continue
+            if rec["_due"] >= now:
+                continue
+            overdue_all.append({
+                "transaction_id": rec["transaction_id"],
+                "book": {"id": rec["book_id"], "title": rec["book_title"]},
+                "member": {"student_id": rec["member_id"], "name": rec["member_name"]},
+                "issue_date": rec["issue_date"],
+                "due_date": rec["due_date"],
+                "days_overdue": (now - rec["_due"]).days,
+            })
+
+        total_count = len(overdue_all)
+        total_pages = (total_count + page_size - 1) // page_size if total_count > 0 else 1
+        start = (page - 1) * page_size
+        page_items = overdue_all[start:start + page_size]
+
+        return jsonify({
+            "status": "ok",
+            "data": {
+                "items": page_items,
+                "count": len(page_items),
+                "total_count": total_count,
+                "missing_due_date_count": missing_due,
+                "total_pages": total_pages,
+                "current_page": page,
+                "page_size": page_size,
+                "last_updated": now.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        })
+    except Exception as e:
+        logger.error(f"Error in external_overdue_transactions: {e}")
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
+
 
 # --- ERROR HANDLERS ---
 @app.errorhandler(404)

@@ -26,7 +26,9 @@ ADMIN_CHAT_ID = 8291437833
 APPROVED_USERS: Set[int] = {ADMIN_CHAT_ID}  # Admin is always approved
 PORT = int(os.environ.get("PORT", "8080"))
 API_BASE = os.environ.get("API_BASE", f"http://127.0.0.1:{PORT}")
-DB_PATH = "islamic_library.db"
+# Same database configuration as brain.py: on Railway LIBRARY_DB_PATH points at the
+# persistent volume (/data/islamic_library.db). Local/dev falls back to the repo file.
+DB_PATH = os.environ.get("LIBRARY_DB_PATH", "").strip() or "islamic_library.db"
 
 # --- LOGGING ---
 class InMemoryLogHandler(logging.Handler):
