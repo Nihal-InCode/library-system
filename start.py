@@ -5,13 +5,16 @@ import os
 
 def start_flask():
     """Start Flask backend in a background thread."""
-    from brain import app, init_db, IMAGES_DIR, restore_db_from_github
+    from brain import app, init_db, IMAGES_DIR, restore_db_from_github, DB_PATH, IS_RAILWAY
     import logging
 
     logger = logging.getLogger(__name__)
 
-    # Restore DB from GitHub Releases if missing (Railway ephemeral storage)
-    restore_db_from_github()
+    # Railway must use its mounted persistent database; never restore a repository copy.
+    if IS_RAILWAY and not os.path.isfile(DB_PATH):
+        raise RuntimeError(f"Configured LIBRARY_DB_PATH does not exist: {DB_PATH}")
+    if not IS_RAILWAY:
+        restore_db_from_github()
 
     init_db()
 
