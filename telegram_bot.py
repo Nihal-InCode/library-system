@@ -33,7 +33,7 @@ TOKEN = get_bot_token()
 ADMIN_CHAT_ID = get_admin_chat_id()
 PORT = int(os.environ.get("PORT", "8080"))
 API_BASE = os.environ.get("API_BASE", f"http://127.0.0.1:{PORT}")
-DB_PATH = "islamic_library.db"
+DB_PATH = os.environ.get("LIBRARY_DB_PATH", "").strip() or "islamic_library.db"
 APPROVED_USERS_FILE = "approved_users.txt"
 
 # --- PERSISTED APPROVALS (file-based, survives DB replacements) ---
